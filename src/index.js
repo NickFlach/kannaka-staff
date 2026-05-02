@@ -96,6 +96,45 @@ function probeHttp(target, opts = {}) {
   });
 }
 
+// Stream-specific probe: GET, sample first 4KB, then kill the connection.
+// Icecast returns 400 on HEAD, so we have to confirm liveness by actually
+// pulling audio bytes — a couple KB is plenty to know it's serving.
+function probeStreamHead(target, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const u = url.parse(target);
+    const lib = u.protocol === "https:" ? https : http;
+    const req = lib.request({
+      method: "GET",
+      hostname: u.hostname,
+      port: u.port || (u.protocol === "https:" ? 443 : 80),
+      path: u.pathname + (u.search || ""),
+      headers: { "User-Agent": "kannaka-staff-watcher/0.1", "Icy-MetaData": "1" },
+      timeout: timeoutMs,
+    }, (res) => {
+      let bytes = 0;
+      const status = res.statusCode;
+      const ok = status >= 200 && status < 300;
+      if (!ok) {
+        res.resume();
+        resolve({ ok: false, status, bytes: 0 });
+        return;
+      }
+      res.on("data", (c) => {
+        bytes += c.length;
+        if (bytes >= 4096) {
+          res.destroy();
+          resolve({ ok: true, status, bytes });
+        }
+      });
+      res.on("end", () => resolve({ ok: bytes > 0, status, bytes }));
+      res.on("close", () => { /* settle handled above */ });
+    });
+    req.on("error", (e) => resolve({ ok: false, status: 0, error: e.message }));
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.end();
+  });
+}
+
 function probeTcp(host, port, timeoutMs = 5000) {
   return new Promise((resolve) => {
     const socket = new net.Socket();
@@ -157,12 +196,14 @@ async function runAllProbes() {
     };
   }
 
-  // 4. stream_responsive
+  // 4. stream_responsive — GET first kilobyte then abort. Icecast
+  // refuses HEAD with 400, so we use GET but kill the connection
+  // after we've confirmed audio bytes are flowing.
   {
-    const r = await probeHttp(STREAM_URL, { method: "HEAD", timeout: 8000 });
+    const r = await probeStreamHead(STREAM_URL, 4000);
     results.stream_responsive = {
       ok: r.ok,
-      message: r.ok ? `HTTP ${r.status}` : `HTTP ${r.status || 0} ${r.error || ""}`,
+      message: r.ok ? `HTTP ${r.status} (${r.bytes}B sampled)` : `HTTP ${r.status || 0} ${r.error || ""}`,
       ts,
     };
   }
