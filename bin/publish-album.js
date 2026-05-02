@@ -51,9 +51,9 @@ const sshHost = arg("ssh-host", "opc@170.9.238.136");
 const remoteMusic = arg("remote-music", "/home/opc/kannaka-radio/music");
 const radioRepo = arg("radio-repo", path.join(process.env.HOME || ".", "Source", "kannaka-radio"));
 const dryRun = flag("dry-run");
-const autoPatch = flag("patch");
-const autoDeploy = flag("deploy"); // implies --patch
-const autoShowcase = flag("showcase"); // implies --deploy
+const autoShowcase = flag("showcase"); // implies --deploy + --patch
+const autoDeploy = flag("deploy") || autoShowcase; // implies --patch
+const autoPatch = flag("patch") || autoDeploy;
 const showcaseDuration = parseInt(arg("showcase-duration", "35"), 10);
 const radioApi = arg("radio-api", "http://170.9.238.136:8888");
 
