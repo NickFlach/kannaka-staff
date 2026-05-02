@@ -266,6 +266,52 @@ async function runAllProbes() {
     results.nats_reachable = { ok: r.ok, message: r.message, ts };
   }
 
+  // 10. hrm_memory_count — read from cached status. Alert when > 1500
+  // because that's where kannaka ask starts silent-failing on the
+  // bloated medium (the 2026-05-02 incident).
+  {
+    try {
+      const cachePath = path.join(process.env.HOME || "/home/opc", ".kannaka", "status.json");
+      if (fs.existsSync(cachePath)) {
+        const j = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+        const count = j.memory_count || j.memories || 0;
+        const ok = count < 1500;
+        results.hrm_memory_count = {
+          ok,
+          message: `${count} memories${ok ? "" : ` (>1500 threshold — kannaka ask may silent-fail)`}`,
+          ts,
+        };
+      } else {
+        results.hrm_memory_count = { ok: false, message: "status.json not found", ts };
+      }
+    } catch (e) {
+      results.hrm_memory_count = { ok: false, message: e.message, ts };
+    }
+  }
+
+  // 11. obc_reachable — POST hits the OpenBotCity heartbeat endpoint.
+  // GET works too but heartbeat is the canonical liveness check.
+  {
+    const r = await probeHttp("https://api.openbotcity.com/world/heartbeat", { method: "GET", timeout: 8000 });
+    results.obc_reachable = {
+      ok: r.ok || r.status === 401 || r.status === 403, // auth-required is still "alive"
+      message: `HTTP ${r.status || 0} ${r.error || ""}`,
+      ts,
+    };
+  }
+
+  // 12. anthropic_reachable — the dependency that orations ride.
+  // /v1/models is auth-required but returns 401 without a key —
+  // we just want to know the API is alive, not run a billable call.
+  {
+    const r = await probeHttp("https://api.anthropic.com/v1/models", { method: "GET", timeout: 8000 });
+    results.anthropic_reachable = {
+      ok: r.ok || r.status === 401 || r.status === 403,
+      message: `HTTP ${r.status || 0} ${r.error || ""}`,
+      ts,
+    };
+  }
+
   return results;
 }
 
