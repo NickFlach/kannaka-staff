@@ -49,7 +49,10 @@ const blocks = (arg("blocks") || "Midday,Afternoon").split(",").map((s) => s.tri
 const sshKey = arg("ssh-key", `${process.env.HOME}/.ssh/ninja-portal-ed25519`);
 const sshHost = arg("ssh-host", "opc@170.9.238.136");
 const remoteMusic = arg("remote-music", "/home/opc/kannaka-radio/music");
+const radioRepo = arg("radio-repo", path.join(process.env.HOME || ".", "Source", "kannaka-radio"));
 const dryRun = flag("dry-run");
+const autoPatch = flag("patch");
+const autoDeploy = flag("deploy"); // implies --patch
 
 if (!staging || !albumName) {
   console.error("Usage: publish-album --staging <dir> --name '<ALBUM>' [--theme '...'] [--blocks 'Midday,Afternoon'] [--dry-run]");
@@ -123,11 +126,119 @@ for (const b of blocks) {
   console.log(`  '${albumName}',`);
 }
 
-// ── Step 4: how to deploy ───────────────────────────────────
-console.log("\n=== to deploy ===");
-console.log("  1. Apply the patches to server/dj-engine.js + server/programming.js");
-console.log("  2. cd kannaka-radio && git add . && git commit -m \"feat(album): " + albumName + "\" && git push");
-console.log(`  3. ssh ${sshHost} 'cd /home/opc/kannaka-radio && git pull --ff-only && sudo systemctl restart kannaka-radio'`);
-console.log(`  4. (optional) curl -X POST 'http://localhost:8888/api/album/showcase?album=${encodeURIComponent(albumName)}'`);
-console.log("");
-console.log("Files are already on Oracle. The patches above are the only manual step.");
+// ── Step 4: auto-patch (--patch / --deploy) ─────────────────
+function patchDjEngine() {
+  const file = path.join(radioRepo, "server", "dj-engine.js");
+  let src = fs.readFileSync(file, "utf8");
+  if (src.includes(`"${albumName}":`)) {
+    console.log(`  ⚠ ${albumName} already in dj-engine.js — skipping patch`);
+    return false;
+  }
+  // Insert before the very last `};` that closes the ALBUMS const.
+  // We anchor on the start of ALBUMS and find the matching close-brace.
+  const startIdx = src.indexOf("const ALBUMS = {");
+  if (startIdx < 0) throw new Error("ALBUMS const not found");
+  // Find the close-brace by walking with depth counting from startIdx.
+  let depth = 0;
+  let endIdx = -1;
+  for (let i = src.indexOf("{", startIdx); i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") { depth--; if (depth === 0) { endIdx = i; break; } }
+  }
+  if (endIdx < 0) throw new Error("ALBUMS close-brace not found");
+  // Find the line with the close brace and insert just before it.
+  const lineStart = src.lastIndexOf("\n", endIdx) + 1;
+  const block = `  "${albumName}": {\n` +
+    `    theme: ${JSON.stringify(theme)},\n` +
+    `    tracks: [\n` +
+    titles.map((t) => `      ${JSON.stringify(t)},`).join("\n") + "\n" +
+    `    ]\n` +
+    `  },\n`;
+  src = src.slice(0, lineStart) + block + src.slice(lineStart);
+  fs.writeFileSync(file, src);
+  return true;
+}
+
+function patchProgramming() {
+  const file = path.join(radioRepo, "server", "programming.js");
+  let src = fs.readFileSync(file, "utf8");
+  let touched = false;
+  for (const blockLabel of blocks) {
+    // Find the SCHEDULE entry whose `label: '<block>'` matches.
+    // Then in the same block object, find `albums: [` and prepend our entry.
+    const labelRe = new RegExp(`label:\\s*['"\`]${blockLabel.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}['"\`]`);
+    const labelMatch = labelRe.exec(src);
+    if (!labelMatch) {
+      console.log(`  ⚠ block label '${blockLabel}' not found — skipping`);
+      continue;
+    }
+    // Find the nearest preceding `albums: [` before this label match
+    // (within the SAME object — we walk backwards looking for it).
+    const slice = src.slice(0, labelMatch.index);
+    const albumsIdx = slice.lastIndexOf("albums:");
+    if (albumsIdx < 0) {
+      console.log(`  ⚠ albums: array for block '${blockLabel}' not found`);
+      continue;
+    }
+    // Find the closing `]` of THAT albums array.
+    const arrStart = src.indexOf("[", albumsIdx);
+    let depth = 0;
+    let arrEnd = -1;
+    for (let i = arrStart; i < src.length; i++) {
+      if (src[i] === "[") depth++;
+      else if (src[i] === "]") { depth--; if (depth === 0) { arrEnd = i; break; } }
+    }
+    if (arrEnd < 0) {
+      console.log(`  ⚠ albums: array close-bracket for block '${blockLabel}' not found`);
+      continue;
+    }
+    // Check if already in this block.
+    const arrSrc = src.slice(arrStart, arrEnd + 1);
+    if (arrSrc.includes(`'${albumName}'`) || arrSrc.includes(`"${albumName}"`)) {
+      console.log(`  ⚠ ${albumName} already in block '${blockLabel}' — skipping`);
+      continue;
+    }
+    // Insert before the close bracket. Honor the existing trailing comma style.
+    const lineStart = src.lastIndexOf("\n", arrEnd) + 1;
+    const insert = `      '${albumName}',\n`;
+    src = src.slice(0, lineStart) + insert + src.slice(lineStart);
+    console.log(`  ✓ patched programming.js — added '${albumName}' to '${blockLabel}'`);
+    touched = true;
+  }
+  if (touched) fs.writeFileSync(file, src);
+  return touched;
+}
+
+if (autoPatch || autoDeploy) {
+  if (dryRun) {
+    console.log("\n[dry-run] would auto-patch dj-engine.js + programming.js");
+  } else {
+    console.log("\n=== Auto-patching radio source ===");
+    try {
+      const djTouched = patchDjEngine();
+      if (djTouched) console.log(`  ✓ patched dj-engine.js — added '${albumName}' to ALBUMS`);
+      const progTouched = patchProgramming();
+      if (autoDeploy) {
+        console.log("\n=== Committing + deploying ===");
+        execFileSync("git", ["add", "server/dj-engine.js", "server/programming.js"], { cwd: radioRepo, stdio: "inherit" });
+        execFileSync("git", ["commit", "-m", `feat(album): ${albumName}`], { cwd: radioRepo, stdio: "inherit" });
+        execFileSync("git", ["push"], { cwd: radioRepo, stdio: "inherit" });
+        console.log("\n  ✓ pushed; restarting Oracle radio service");
+        execFileSync("ssh", ["-i", sshKey, "-o", "StrictHostKeyChecking=no", sshHost,
+          `cd /home/opc/kannaka-radio && git pull --ff-only && sudo systemctl restart kannaka-radio`],
+          { stdio: "inherit" });
+        console.log(`  ✓ deployed`);
+      }
+    } catch (e) {
+      console.error(`\n  ✗ auto-patch/deploy failed: ${e.message}`);
+      console.error("  Files may be partially modified — review with git diff before committing.");
+      process.exit(1);
+    }
+  }
+} else {
+  console.log("\n=== to deploy ===");
+  console.log("  Re-run with --patch (auto-edits dj-engine.js + programming.js)");
+  console.log("  Or --deploy (patch + commit + push + ssh restart)");
+  console.log("");
+  console.log(`  curl -X POST 'http://localhost:8888/api/album/showcase?album=${encodeURIComponent(albumName)}'  # after deploy`);
+}
