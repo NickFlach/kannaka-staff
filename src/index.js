@@ -71,6 +71,10 @@ function probeHttp(target, opts = {}) {
   return new Promise((resolve) => {
     const u = url.parse(target);
     const lib = u.protocol === "https:" ? https : http;
+    // Probes default to a small body cap (2KB) — enough for status lines.
+    // Curator-style fetches that need full JSON bodies override via
+    // opts.maxBody. Default cap kept at 2000 chars for the small probes.
+    const maxBody = opts.maxBody != null ? opts.maxBody : 2000;
     const req = lib.request({
       method: opts.method || "GET",
       hostname: u.hostname,
@@ -82,10 +86,10 @@ function probeHttp(target, opts = {}) {
       let bytes = 0;
       res.on("data", (c) => {
         bytes += c.length;
-        if (chunks.length < 50) chunks.push(c); // cap captured body
+        chunks.push(c);
       });
       res.on("end", () => {
-        const body = Buffer.concat(chunks).toString("utf8").slice(0, 2000);
+        const body = Buffer.concat(chunks).toString("utf8").slice(0, maxBody);
         const ok = res.statusCode >= 200 && res.statusCode < 400;
         resolve({ ok, status: res.statusCode, body, bytes });
       });
@@ -272,7 +276,7 @@ async function runAllProbes() {
 // (no plays in N hours) so we can see when the rotation is starving
 // half the catalog.
 async function fetchAlbumStaleness() {
-  const r = await probeHttp(`${RADIO_BASE}/api/history?limit=200`, { timeout: 5000 });
+  const r = await probeHttp(`${RADIO_BASE}/api/history?limit=200`, { timeout: 5000, maxBody: 200 * 1024 });
   if (!r.ok) return { ok: false, message: `HTTP ${r.status} ${r.error || ""}`, albums: [] };
   let hist;
   try { hist = JSON.parse(r.body).history || []; }
@@ -291,7 +295,7 @@ async function fetchAlbumStaleness() {
 
   // Also fetch the radio's full album list so we can flag albums that
   // never appeared in the last-200 history.
-  const stateR = await probeHttp(`${RADIO_BASE}/api/state`, { timeout: 5000 });
+  const stateR = await probeHttp(`${RADIO_BASE}/api/state`, { timeout: 5000, maxBody: 200 * 1024 });
   let allAlbums = [];
   if (stateR.ok) {
     try {
