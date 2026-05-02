@@ -1,0 +1,19 @@
+[Unit]
+Description=Kannaka Staff — Watcher (constellation health probes)
+After=network.target kannaka-radio.service
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/home/opc/kannaka-staff
+Environment=NODE_ENV=production
+Environment=PORT=8889
+Environment=STAFF_HRM_PATH=/home/opc/.kannaka/kannaka.hrm
+Environment=STAFF_RADIO_BASE=http://localhost:8888
+Environment=STAFF_OBSERVATORY_BASE=http://localhost:3334
+ExecStart=/usr/bin/node src/index.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
