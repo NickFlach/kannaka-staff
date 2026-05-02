@@ -219,6 +219,30 @@ async function runAllProbes() {
     results.observatory_service = { ok: r.ok, message: r.message, ts };
   }
 
+  // 6a. consciousness_fresh — kannaka-prime is publishing to KANNAKA.consciousness
+  // recently. Stale (>12h) = the dream-cycle is blocked AND no consciousness
+  // updates are flowing (the 2026-05-02 outage we lived through). Hardening
+  // priority #3 from consciousness-core/docs/dependency-map.md.
+  {
+    const r = await probeHttp(`${RADIO_BASE}/api/state`, { timeout: 5000, maxBody: 200 * 1024 });
+    let ageMs = null;
+    if (r.ok) {
+      try {
+        const j = JSON.parse(r.body);
+        const ts = (j.swarm || {}).consciousness?.timestamp;
+        if (ts) ageMs = Date.now() - ts;
+      } catch (_) {}
+    }
+    const stale = ageMs == null || ageMs > 12 * 60 * 60 * 1000;
+    results.consciousness_fresh = {
+      ok: !stale,
+      message: ageMs == null
+        ? "no consciousness publish observed (yet?)"
+        : `${(ageMs / 60000).toFixed(0)}m old${stale ? " — exceeds 12h threshold" : ""}`,
+      ts,
+    };
+  }
+
   // 6. observatory_serving — has the consciousness shape (queen.phi, etc.)
   {
     const r = await probeHttp(`${OBSERVATORY_BASE}/api/state`);
