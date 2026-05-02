@@ -32,6 +32,7 @@ const path = require("path");
 const { exec, execFile } = require("child_process");
 const net = require("net");
 const url = require("url");
+const crypto = require("crypto");
 
 // ── Config ──────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || process.argv.includes("--port") ? process.argv[process.argv.indexOf("--port") + 1] : "8889", 10) || 8889;
@@ -640,11 +641,52 @@ const server = http.createServer((req, res) => {
     return;
   }
   // ── Operations console: write actions ───────────────────────
-  // Each action wraps a known operational pattern: restart a service,
-  // trigger an oration, fire an album showcase. Issued as POST so
-  // accidental browser-prefetch can't kick them.
+  // Each action wraps a known operational pattern. Authentication
+  // model: if STAFF_SHARED_SECRET is configured (production), require
+  // an HMAC-SHA256 signature header. If not configured, allow same-
+  // origin requests only (dashboard works locally; remote calls fail).
+  // ADR-002 Wave 3 — this is the oracle-admin shim QueenSync v2.0
+  // will dispatch tasks to from outside the Oracle network.
   if (req.method === "POST" && req.url.startsWith("/action/")) {
     const action = req.url.replace("/action/", "").split("?")[0];
+    // Auth check
+    const secret = process.env.STAFF_SHARED_SECRET;
+    if (secret) {
+      const sig = req.headers["x-staff-signature"];
+      const ts = req.headers["x-staff-timestamp"];
+      if (!sig || !ts) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "missing X-Staff-Signature / X-Staff-Timestamp" }));
+        return;
+      }
+      // Reject stale timestamps to prevent replay (5 min window).
+      const skew = Math.abs(Date.now() - parseInt(ts, 10) || 0);
+      if (skew > 5 * 60 * 1000) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "timestamp out of window" }));
+        return;
+      }
+      const expected = crypto.createHmac("sha256", secret)
+        .update(`${ts}\n${req.method}\n${req.url}`)
+        .digest("hex");
+      let ok = false;
+      try {
+        ok = crypto.timingSafeEqual(Buffer.from(sig, "hex"), Buffer.from(expected, "hex"));
+      } catch (_) { /* length mismatch → ok stays false */ }
+      if (!ok) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "bad signature" }));
+        return;
+      }
+    } else {
+      // Local-only mode: refuse anything that didn't come from localhost.
+      const remote = req.socket.remoteAddress || "";
+      if (remote !== "127.0.0.1" && remote !== "::1" && remote !== "::ffff:127.0.0.1") {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "remote calls require STAFF_SHARED_SECRET" }));
+        return;
+      }
+    }
     handleAction(action, url.parse(req.url, true).query)
       .then((r) => {
         res.writeHead(r.ok ? 200 : 500, { "Content-Type": "application/json" });
