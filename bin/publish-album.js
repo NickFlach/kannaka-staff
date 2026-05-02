@@ -163,11 +163,20 @@ function patchDjEngine() {
     if (c === "}") needComma = true;
     break;
   }
+  let insertAt = lineStart;
   if (needComma) {
     // Insert the comma right after the last `}` we found.
     const closeIdx = src.lastIndexOf("}", lineStart - 1);
     if (closeIdx >= 0) {
       src = src.slice(0, closeIdx + 1) + "," + src.slice(closeIdx + 1);
+      // The insertion shifted everything after closeIdx by 1 byte.
+      // lineStart was after closeIdx, so bump by 1 to keep pointing
+      // at the same logical position. (The earlier version used
+      // lastIndexOf("};") to recompute, but that finds the LAST };
+      // in the entire file — which can be deep inside the DJEngine
+      // class methods. Bug: 2026-05-02 VACUUM GARDEN landed at line
+      // 1201 instead of inside ALBUMS. Don't repeat that.)
+      insertAt = lineStart + 1;
       console.log("  ⚠ inserted missing trailing comma after previous album entry");
     }
   }
@@ -177,10 +186,7 @@ function patchDjEngine() {
     titles.map((t) => `      ${JSON.stringify(t)},`).join("\n") + "\n" +
     `    ]\n` +
     `  },\n`;
-  // Re-find lineStart since src may have shifted by 1 byte if we inserted a comma.
-  const recomputedClose = src.lastIndexOf("};");
-  const recomputedLineStart = src.lastIndexOf("\n", recomputedClose) + 1;
-  src = src.slice(0, recomputedLineStart) + block + src.slice(recomputedLineStart);
+  src = src.slice(0, insertAt) + block + src.slice(insertAt);
   fs.writeFileSync(file, src);
   return true;
 }
