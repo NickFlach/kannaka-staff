@@ -265,6 +265,62 @@ async function runAllProbes() {
   return results;
 }
 
+// ── Curator: album-staleness audit ──────────────────────────
+//
+// Uses kannaka-radio's /api/history endpoint to compute per-album
+// last-played time. The watcher dashboard surfaces "stale albums"
+// (no plays in N hours) so we can see when the rotation is starving
+// half the catalog.
+async function fetchAlbumStaleness() {
+  const r = await probeHttp(`${RADIO_BASE}/api/history?limit=200`, { timeout: 5000 });
+  if (!r.ok) return { ok: false, message: `HTTP ${r.status} ${r.error || ""}`, albums: [] };
+  let hist;
+  try { hist = JSON.parse(r.body).history || []; }
+  catch (e) { return { ok: false, message: `parse: ${e.message}`, albums: [] }; }
+
+  const now = Date.now();
+  const lastByAlbum = {};
+  const countByAlbum = {};
+  for (const h of hist) {
+    if (!h.album || h.commercial) continue;
+    countByAlbum[h.album] = (countByAlbum[h.album] || 0) + 1;
+    if (!lastByAlbum[h.album] || (h.playedAt || 0) > lastByAlbum[h.album]) {
+      lastByAlbum[h.album] = h.playedAt || 0;
+    }
+  }
+
+  // Also fetch the radio's full album list so we can flag albums that
+  // never appeared in the last-200 history.
+  const stateR = await probeHttp(`${RADIO_BASE}/api/state`, { timeout: 5000 });
+  let allAlbums = [];
+  if (stateR.ok) {
+    try {
+      const s = JSON.parse(stateR.body);
+      allAlbums = (s.albums || []).map((a) => a.name || a);
+    } catch (_) { /* ignore */ }
+  }
+
+  const albums = [];
+  for (const album of new Set([...allAlbums, ...Object.keys(lastByAlbum)])) {
+    const last = lastByAlbum[album] || 0;
+    const ageMs = last ? now - last : null;
+    albums.push({
+      album,
+      lastPlayed: last || null,
+      ageMs,
+      playsInWindow: countByAlbum[album] || 0,
+    });
+  }
+  // Sort: never-played first (ageMs null), then oldest first.
+  albums.sort((a, b) => {
+    if (a.ageMs == null && b.ageMs == null) return 0;
+    if (a.ageMs == null) return -1;
+    if (b.ageMs == null) return 1;
+    return b.ageMs - a.ageMs;
+  });
+  return { ok: true, albums, historyLen: hist.length };
+}
+
 // ── Tick loop ───────────────────────────────────────────────
 async function tick() {
   let probeResults;
@@ -354,6 +410,10 @@ h1 { font-family: Orbitron, sans-serif; font-size: 1.4rem; color: var(--vio); ma
   <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">RECENT ALERTS</h3>
   <div id="alerts"><div class="empty">no recent transitions</div></div>
 </div>
+<div class="alerts">
+  <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">CURATOR — ALBUM STALENESS</h3>
+  <div id="staleness"><div class="empty">loading…</div></div>
+</div>
 <script>
 function fmtAge(ms) {
   if (ms < 60_000) return Math.round(ms/1000) + 's';
@@ -386,6 +446,20 @@ async function refresh() {
         '<div class="alert ' + e.transition + '"><span class="when">' + e.ts + '</span><strong>' + e.transition + '</strong> ' + e.probe + ' — ' + (e.message||'').replace(/</g,'&lt;') + '</div>'
       ).join('');
     }
+    // Curator panel — least-recently-played albums first
+    try {
+      const cur = await fetch('/api/album-staleness').then(r => r.json());
+      const stale = document.getElementById('staleness');
+      if (cur.ok && cur.albums && cur.albums.length > 0) {
+        stale.innerHTML = cur.albums.slice(0, 12).map(c => {
+          const ago = c.ageMs == null ? '<span style="color: var(--fail)">never (in last ' + (cur.historyLen||0) + ')</span>' : fmtAge(c.ageMs) + ' ago';
+          const plays = c.playsInWindow ? c.playsInWindow + 'x' : '0x';
+          return '<div class="alert" style="border-left-color: ' + (c.ageMs == null ? 'var(--fail)' : c.ageMs > 21600000 ? '#fbbf24' : 'var(--ok)') + ';"><strong>' + c.album + '</strong> · last: ' + ago + ' · plays in window: ' + plays + '</div>';
+        }).join('');
+      } else {
+        stale.innerHTML = '<div class="empty">' + (cur.message || 'no staleness data') + '</div>';
+      }
+    } catch (_) {}
     document.getElementById('meta').textContent =
       'tick: ' + (s.lastTick ? new Date(s.lastTick).toLocaleTimeString() : '?') + ' · probes: ' + Object.keys(probes).length + ' · alerts logged: ' + a.length;
   } catch (e) {
@@ -416,6 +490,18 @@ const server = http.createServer((req, res) => {
   if (req.url.startsWith("/api/alerts")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(recentAlerts(100)));
+    return;
+  }
+  if (req.url === "/api/album-staleness") {
+    fetchAlbumStaleness()
+      .then((r) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(r));
+      })
+      .catch((e) => {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      });
     return;
   }
   res.writeHead(404, { "Content-Type": "text/plain" });
