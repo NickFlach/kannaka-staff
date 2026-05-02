@@ -53,6 +53,9 @@ const radioRepo = arg("radio-repo", path.join(process.env.HOME || ".", "Source",
 const dryRun = flag("dry-run");
 const autoPatch = flag("patch");
 const autoDeploy = flag("deploy"); // implies --patch
+const autoShowcase = flag("showcase"); // implies --deploy
+const showcaseDuration = parseInt(arg("showcase-duration", "35"), 10);
+const radioApi = arg("radio-api", "http://170.9.238.136:8888");
 
 if (!staging || !albumName) {
   console.error("Usage: publish-album --staging <dir> --name '<ALBUM>' [--theme '...'] [--blocks 'Midday,Afternoon'] [--dry-run]");
@@ -241,7 +244,7 @@ if (autoPatch || autoDeploy) {
       const djTouched = patchDjEngine();
       if (djTouched) console.log(`  ✓ patched dj-engine.js — added '${albumName}' to ALBUMS`);
       const progTouched = patchProgramming();
-      if (autoDeploy) {
+      if (autoDeploy || autoShowcase) {
         console.log("\n=== Committing + deploying ===");
         execFileSync("git", ["add", "server/dj-engine.js", "server/programming.js"], { cwd: radioRepo, stdio: "inherit" });
         execFileSync("git", ["commit", "-m", `feat(album): ${albumName}`], { cwd: radioRepo, stdio: "inherit" });
@@ -251,6 +254,18 @@ if (autoPatch || autoDeploy) {
           `cd /home/opc/kannaka-radio && git pull --ff-only && sudo systemctl restart kannaka-radio`],
           { stdio: "inherit" });
         console.log(`  ✓ deployed`);
+      }
+      if (autoShowcase) {
+        console.log("\n=== Triggering showcase ===");
+        // Wait a beat for the radio service to come back up after restart.
+        execFileSync("ssh", ["-i", sshKey, "-o", "StrictHostKeyChecking=no", sshHost,
+          `until sudo systemctl is-active kannaka-radio >/dev/null 2>&1; do sleep 2; done; sleep 3`],
+          { stdio: "inherit" });
+        const showcaseUrl = `${radioApi}/api/album/showcase?album=${encodeURIComponent(albumName)}&duration=${showcaseDuration}`;
+        execFileSync("ssh", ["-i", sshKey, "-o", "StrictHostKeyChecking=no", sshHost,
+          `curl -s -X POST '${showcaseUrl.replace(radioApi, "http://localhost:8888")}'`],
+          { stdio: "inherit" });
+        console.log(`\n  ✓ showcase triggered for ${albumName} (${showcaseDuration} min)`);
       }
     } catch (e) {
       console.error(`\n  ✗ auto-patch/deploy failed: ${e.message}`);
