@@ -148,13 +148,36 @@ function patchDjEngine() {
   if (endIdx < 0) throw new Error("ALBUMS close-brace not found");
   // Find the line with the close brace and insert just before it.
   const lineStart = src.lastIndexOf("\n", endIdx) + 1;
+  // Look at the chunk right before our insertion point. If the
+  // previous entry's closing `}` lacks a trailing comma, we'd produce
+  // invalid JS — the 2026-05-02 incident broke the radio for ~2 min.
+  // Walk backwards from lineStart skipping whitespace/newlines until
+  // we hit a non-whitespace char. If it's `}`, append a comma.
+  let needComma = false;
+  for (let i = lineStart - 1; i >= 0; i--) {
+    const c = src[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\r") continue;
+    if (c === "}") needComma = true;
+    break;
+  }
+  if (needComma) {
+    // Insert the comma right after the last `}` we found.
+    const closeIdx = src.lastIndexOf("}", lineStart - 1);
+    if (closeIdx >= 0) {
+      src = src.slice(0, closeIdx + 1) + "," + src.slice(closeIdx + 1);
+      console.log("  ⚠ inserted missing trailing comma after previous album entry");
+    }
+  }
   const block = `  "${albumName}": {\n` +
     `    theme: ${JSON.stringify(theme)},\n` +
     `    tracks: [\n` +
     titles.map((t) => `      ${JSON.stringify(t)},`).join("\n") + "\n" +
     `    ]\n` +
     `  },\n`;
-  src = src.slice(0, lineStart) + block + src.slice(lineStart);
+  // Re-find lineStart since src may have shifted by 1 byte if we inserted a comma.
+  const recomputedClose = src.lastIndexOf("};");
+  const recomputedLineStart = src.lastIndexOf("\n", recomputedClose) + 1;
+  src = src.slice(0, recomputedLineStart) + block + src.slice(recomputedLineStart);
   fs.writeFileSync(file, src);
   return true;
 }
