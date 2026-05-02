@@ -300,7 +300,22 @@ async function runAllProbes() {
     };
   }
 
-  // 12. anthropic_reachable — the dependency that orations ride.
+  // 12. disk_space — Oracle's root filesystem. Alert under 5 GB free.
+  // Music dir + HRM file + journal logs + album mp3s grow fast.
+  {
+    const r = await new Promise((resolve) => {
+      exec("df -BM --output=avail / | tail -1", { timeout: 5000 }, (err, stdout) => {
+        if (err) return resolve({ ok: false, message: err.message });
+        const free = parseInt((stdout || "").trim().replace("M", ""), 10);
+        if (isNaN(free)) return resolve({ ok: false, message: `parse: ${(stdout || "").trim()}` });
+        const ok = free > 5 * 1024; // 5 GB
+        resolve({ ok, message: `${(free / 1024).toFixed(1)} GB free${ok ? "" : " (under 5 GB threshold)"}` });
+      });
+    });
+    results.disk_space = { ok: r.ok, message: r.message, ts };
+  }
+
+  // 13. anthropic_reachable — the dependency that orations ride.
   // /v1/models is auth-required but returns 401 without a key —
   // we just want to know the API is alive, not run a billable call.
   {
