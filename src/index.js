@@ -271,10 +271,10 @@ async function runAllProbes() {
   // bloated medium (the 2026-05-02 incident).
   {
     try {
-      const cachePath = path.join(process.env.HOME || "/home/opc", ".kannaka", "status.json");
+      const cachePath = path.join(process.env.HOME || "/home/opc", ".kannaka", "status-cache.json");
       if (fs.existsSync(cachePath)) {
         const j = JSON.parse(fs.readFileSync(cachePath, "utf8"));
-        const count = j.memory_count || j.memories || 0;
+        const count = j.total_memories || j.memory_count || j.memories || 0;
         const ok = count < 1500;
         results.hrm_memory_count = {
           ok,
