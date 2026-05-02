@@ -414,6 +414,45 @@ async function tick() {
   state.lastTick = Date.now();
 }
 
+// ── Operations actions ──────────────────────────────────────
+async function handleAction(action, query) {
+  switch (action) {
+    case "restart-radio":
+      return execActionLocal("sudo", ["/bin/systemctl", "restart", "kannaka-radio"]);
+    case "restart-observatory":
+      return execActionLocal("sudo", ["/bin/systemctl", "restart", "kannaka-observatory"]);
+    case "trigger-oration": {
+      const r = await probeHttp(`${RADIO_BASE}/api/oration/now`, { method: "POST", timeout: 10_000, maxBody: 4096 });
+      return { ok: r.ok, status: r.status, body: r.body };
+    }
+    case "trigger-showcase": {
+      const album = (query.album || "BEND THE ARC").toString();
+      const duration = parseInt(query.duration || "35", 10);
+      const target = `${RADIO_BASE}/api/album/showcase?album=${encodeURIComponent(album)}&duration=${duration}`;
+      const r = await probeHttp(target, { method: "POST", timeout: 10_000, maxBody: 4096 });
+      return { ok: r.ok, album, duration, status: r.status, body: r.body };
+    }
+    case "trigger-dream": {
+      // Run dream lite in the background — return immediately so
+      // the dashboard isn't blocked. It can take 5+ min on a bloated
+      // medium; the watcher's existing probes will catch the result.
+      exec("/home/opc/kannaka-memory/target/release/kannaka dream --mode lite", { timeout: 900_000 }, () => {});
+      return { ok: true, kind: "dream", note: "spawned in background; watch hrm_size + observatory_serving probes" };
+    }
+    default:
+      return { ok: false, error: `unknown action: ${action}` };
+  }
+}
+
+function execActionLocal(cmd, args) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout: 30_000 }, (err, stdout, stderr) => {
+      if (err) return resolve({ ok: false, error: err.message, stderr: (stderr || "").trim().slice(0, 500) });
+      resolve({ ok: true, stdout: (stdout || "").trim().slice(0, 500) });
+    });
+  });
+}
+
 // ── HTTP server ─────────────────────────────────────────────
 function recentAlerts(limit = 50) {
   try {
@@ -451,10 +490,22 @@ h1 { font-family: Orbitron, sans-serif; font-size: 1.4rem; color: var(--vio); ma
 .alert.RECOVERED { border-left-color: var(--ok); background: rgba(74,222,128,0.04); }
 .alert .when { color: var(--dim); margin-right: 8px; }
 .empty { color: var(--dim); font-style: italic; }
+.btn { background: rgba(167,139,250,0.12); color: var(--ink); border: 1px solid rgba(167,139,250,0.4); border-radius: 4px; padding: 6px 12px; font-family: inherit; font-size: 0.8rem; cursor: pointer; }
+.btn:hover { background: rgba(167,139,250,0.25); }
+.btn.warn { border-color: rgba(248,113,113,0.5); color: var(--fail); }
+.btn.warn:hover { background: rgba(248,113,113,0.15); }
 </style></head>
 <body>
 <h1>⛩ kannaka-staff — watcher</h1>
 <div class="tag" id="meta">loading…</div>
+<div class="actions" style="margin: 16px 0; display: flex; gap: 8px; flex-wrap: wrap;">
+  <button onclick="act('trigger-oration')" class="btn">🕊 trigger oration</button>
+  <button onclick="act('trigger-showcase', { album: 'BEND THE ARC' })" class="btn">🎞 BEND THE ARC showcase</button>
+  <button onclick="act('trigger-dream')" class="btn">🌙 dream lite</button>
+  <button onclick="confirmAct('restart-radio')" class="btn warn">↻ restart radio</button>
+  <button onclick="confirmAct('restart-observatory')" class="btn warn">↻ restart observatory</button>
+</div>
+<div id="actionResult" style="font-size: 0.78rem; color: var(--dim); min-height: 16px; margin-bottom: 12px;"></div>
 <div class="grid" id="probes"></div>
 <div class="alerts">
   <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">RECENT ALERTS</h3>
@@ -518,6 +569,25 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 10000);
+
+async function act(action, params) {
+  const result = document.getElementById('actionResult');
+  result.textContent = '⏳ ' + action + '…';
+  const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+  try {
+    const r = await fetch('/action/' + action + qs, { method: 'POST' });
+    const j = await r.json();
+    result.textContent = (j.ok ? '✓ ' : '✗ ') + action + ' — ' + (j.note || j.body || j.error || '').toString().slice(0, 200);
+    setTimeout(() => refresh(), 3000);
+  } catch (e) {
+    result.textContent = '✗ ' + action + ' — ' + e.message;
+  }
+}
+
+function confirmAct(action) {
+  if (!confirm('Run ' + action + ' on the radio? This will interrupt playback.')) return;
+  act(action);
+}
 </script>
 </body></html>`;
 }
@@ -546,6 +616,23 @@ const server = http.createServer((req, res) => {
     fetchAlbumStaleness()
       .then((r) => {
         res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(r));
+      })
+      .catch((e) => {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      });
+    return;
+  }
+  // ── Operations console: write actions ───────────────────────
+  // Each action wraps a known operational pattern: restart a service,
+  // trigger an oration, fire an album showcase. Issued as POST so
+  // accidental browser-prefetch can't kick them.
+  if (req.method === "POST" && req.url.startsWith("/action/")) {
+    const action = req.url.replace("/action/", "").split("?")[0];
+    handleAction(action, url.parse(req.url, true).query)
+      .then((r) => {
+        res.writeHead(r.ok ? 200 : 500, { "Content-Type": "application/json" });
         res.end(JSON.stringify(r));
       })
       .catch((e) => {
