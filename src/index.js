@@ -649,9 +649,12 @@ const server = http.createServer((req, res) => {
   // will dispatch tasks to from outside the Oracle network.
   if (req.method === "POST" && req.url.startsWith("/action/")) {
     const action = req.url.replace("/action/", "").split("?")[0];
-    // Auth check
+    // Auth check. Localhost always allowed (the dashboard's quick-action
+    // buttons + local SSH-tunnel ops). Remote callers must HMAC-sign.
     const secret = process.env.STAFF_SHARED_SECRET;
-    if (secret) {
+    const remote = req.socket.remoteAddress || "";
+    const isLocal = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+    if (secret && !isLocal) {
       const sig = req.headers["x-staff-signature"];
       const ts = req.headers["x-staff-timestamp"];
       if (!sig || !ts) {
@@ -678,15 +681,13 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ ok: false, error: "bad signature" }));
         return;
       }
-    } else {
-      // Local-only mode: refuse anything that didn't come from localhost.
-      const remote = req.socket.remoteAddress || "";
-      if (remote !== "127.0.0.1" && remote !== "::1" && remote !== "::ffff:127.0.0.1") {
-        res.writeHead(403, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "remote calls require STAFF_SHARED_SECRET" }));
-        return;
-      }
+    } else if (!secret && !isLocal) {
+      // No secret configured AND not local — refuse remote calls entirely.
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "remote calls require STAFF_SHARED_SECRET" }));
+      return;
     }
+    // else: localhost (always allowed) OR signed remote (verified above)
     handleAction(action, url.parse(req.url, true).query)
       .then((r) => {
         res.writeHead(r.ok ? 200 : 500, { "Content-Type": "application/json" });
