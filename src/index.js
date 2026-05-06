@@ -202,6 +202,112 @@ async function probeRadioPortAlive() {
   return { ok: true, message: "service active + port 8888 bound" };
 }
 
+// ADR-002 Probe 3 — metadata mount alignment. icecast-metadata.js
+// defaults to /preview but the public SPA points listeners at /stream.
+// Without `export ICECAST_MOUNT=/stream` in run-radio.sh, listeners see
+// blank Now-Playing forever. Probe reads run-radio.sh directly (proc/
+// environ is hidden by systemd hardening).
+function probeMetadataMountAlignment() {
+  return new Promise((resolve) => {
+    require("fs").readFile("/home/opc/run-radio.sh", "utf8", (err, content) => {
+      if (err) return resolve({ ok: false, message: `cannot read run-radio.sh: ${err.message}` });
+      const m = content.match(/^\s*export\s+ICECAST_MOUNT=(\S+)/m);
+      const mount = m ? m[1].replace(/['"]/g, "") : "/preview";
+      if (mount !== "/stream") {
+        return resolve({ ok: false, message: `ICECAST_MOUNT=${mount} but listeners are on /stream` });
+      }
+      resolve({ ok: true, message: `ICECAST_MOUNT=${mount}` });
+    });
+  });
+}
+
+// ADR-002 Probe 4 — stream_metadata_advancing. Polls icecast status-json
+// every tick. Tracks /stream title + last change time. Alert if listeners
+// >0 and title hasn't advanced in TRACK_STALL_MS. Catches dj-engine
+// stalls, source-disconnect-without-restart, and metadata-writer death.
+const _streamTracker = { title: null, lastChangeAt: 0 };
+async function probeStreamMetadataAdvancing() {
+  const r = await probeHttp("http://127.0.0.1:8000/status-json.xsl", { timeout: 5000 });
+  if (!r.ok) return { ok: false, message: `icecast status-json: ${r.message || r.status}` };
+  let stream;
+  try {
+    const d = JSON.parse(r.body).icestats;
+    const sources = Array.isArray(d.source) ? d.source : d.source ? [d.source] : [];
+    stream = sources.find((s) => (s.listenurl || "").endsWith("/stream"));
+  } catch (e) {
+    return { ok: false, message: `parse error: ${e.message}` };
+  }
+  if (!stream) return { ok: false, message: "/stream mount not found in icecast status" };
+  const title = stream.title || "";
+  const listeners = stream.listeners || 0;
+  const now = Date.now();
+  if (title !== _streamTracker.title) {
+    _streamTracker.title = title;
+    _streamTracker.lastChangeAt = now;
+  }
+  const stallMs = now - _streamTracker.lastChangeAt;
+  if (stallMs > TRACK_STALL_MS && listeners > 0) {
+    return {
+      ok: false,
+      message: `title unchanged ${Math.round(stallMs / 60000)}m: "${title}" (${listeners} listener${listeners === 1 ? "" : "s"})`,
+    };
+  }
+  return {
+    ok: true,
+    message: `"${title || "(no title)"}" — ${listeners} listener${listeners === 1 ? "" : "s"} — ${Math.round(stallMs / 1000)}s since last change`,
+  };
+}
+
+// ADR-002 Probe 5 — podcast_files_playable. Walks the podcast dir and
+// runs ffprobe on each .mp3, checking sample_rate=44100 and
+// bit_rate<=192000. Files outside the envelope crash the radio's
+// pipe-fed ffmpeg the instant they're played; the podcast scheduler
+// then reports "all episodes finished" 5s in. Caught the 2026-05-06
+// 10:00 AM CST silent-podcast bug retroactively. Hourly probe.
+const PODCAST_DIR = "/home/opc/kannaka-radio/music/Ghost Signals Podcast";
+let _lastPodcastProbeAt = 0;
+let _lastPodcastResult = { ok: true, message: "not yet probed" };
+async function probePodcastFilesPlayable() {
+  const now = Date.now();
+  if (now - _lastPodcastProbeAt < 60 * 60 * 1000) return _lastPodcastResult;
+  _lastPodcastProbeAt = now;
+  const fs = require("fs");
+  const path = require("path");
+  if (!fs.existsSync(PODCAST_DIR)) {
+    _lastPodcastResult = { ok: true, message: "no podcast dir" };
+    return _lastPodcastResult;
+  }
+  const files = fs
+    .readdirSync(PODCAST_DIR)
+    .filter((f) => f.endsWith(".mp3") && !f.endsWith(".original.mp3"));
+  if (files.length === 0) {
+    _lastPodcastResult = { ok: true, message: "no podcast files" };
+    return _lastPodcastResult;
+  }
+  const bad = [];
+  for (const f of files) {
+    const p = path.join(PODCAST_DIR, f);
+    const out = await new Promise((res) =>
+      exec(
+        `ffprobe -v error -show_entries stream=sample_rate,bit_rate -of default=noprint_wrappers=1 ${JSON.stringify(p)}`,
+        { timeout: 8000 },
+        (_e, o) => res(o || ""),
+      ),
+    );
+    const sr = (out.match(/sample_rate=(\d+)/) || [])[1];
+    const br = (out.match(/bit_rate=(\d+)/) || [])[1];
+    if (sr !== "44100" || (br && parseInt(br, 10) > 192000)) {
+      bad.push(`${f} (sr=${sr || "?"} br=${br || "?"})`);
+    }
+  }
+  if (bad.length > 0) {
+    _lastPodcastResult = { ok: false, message: `${bad.length} podcast file(s) outside envelope: ${bad.join("; ")}` };
+  } else {
+    _lastPodcastResult = { ok: true, message: `${files.length} podcast file(s) within envelope (44.1kHz, ≤192kbps)` };
+  }
+  return _lastPodcastResult;
+}
+
 async function runAllProbes() {
   const ts = Date.now();
   const results = {};
@@ -222,6 +328,24 @@ async function runAllProbes() {
   {
     const r = await probeRadioPortAlive();
     results.radio_port_alive = { ok: r.ok, message: r.message, ts };
+  }
+
+  // 1c. metadata_mount_alignment — ICECAST_MOUNT vs public SPA mount (ADR-002 Probe 3)
+  {
+    const r = await probeMetadataMountAlignment();
+    results.metadata_mount_alignment = { ok: r.ok, message: r.message, ts };
+  }
+
+  // 1d. stream_metadata_advancing — title change cadence (ADR-002 Probe 4)
+  {
+    const r = await probeStreamMetadataAdvancing();
+    results.stream_metadata_advancing = { ok: r.ok, message: r.message, ts };
+  }
+
+  // 1e. podcast_files_playable — sample-rate/bitrate envelope (ADR-002 Probe 5, hourly)
+  {
+    const r = await probePodcastFilesPlayable();
+    results.podcast_files_playable = { ok: r.ok, message: r.message, ts };
   }
 
   // 2. radio_now_playing
