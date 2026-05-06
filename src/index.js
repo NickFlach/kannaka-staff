@@ -158,6 +158,50 @@ function probeTcp(host, port, timeoutMs = 5000) {
   });
 }
 
+// ADR-002 Probe 1 — count kannaka-radio processes. The 2026-05-05 PH
+// launch incident had two competing radio nodes (PM2 + systemd); the
+// existing radio_service probe returned green because one was systemd-
+// managed. This probe asks the right question: how many.
+//
+// systemd hardening hides /proc/<pid>/cwd from other processes, so we
+// match on the exact cmdline. The cmdline `node server/index.js --port
+// 8888` is unique to the radio (staff is on 8889, observatory on 3334).
+function probeRadioSingleton() {
+  return new Promise((resolve) => {
+    exec("pgrep -f 'node server/index.js --port 8888'", { timeout: 5000 }, (_err, stdout) => {
+      const pids = (stdout || "")
+        .split("\n")
+        .map((s) => s.trim())
+        .filter((s) => /^\d+$/.test(s));
+      if (pids.length === 0) {
+        resolve({ ok: false, message: "no radio process matched cmdline" });
+      } else if (pids.length === 1) {
+        resolve({ ok: true, message: `1 process (pid=${pids[0]})` });
+      } else {
+        resolve({ ok: false, message: `DUPLICATE: ${pids.length} processes — pids ${pids.join(", ")}` });
+      }
+    });
+  });
+}
+
+// ADR-002 Probe 2 — radio_port_alive. systemd reports active when the
+// node process is alive even if the HTTP server died inside the node.
+// Composite check: service active AND TCP port bound. Catches the
+// silent HTTP-server death pattern that caused the SPA's recently-
+// played panel to go stale on launch day.
+async function probeRadioPortAlive() {
+  const sysd = await probeSystemd("kannaka-radio.service");
+  if (!sysd.ok) return { ok: false, message: `service not active: ${sysd.message}` };
+  const tcp = await probeTcp("127.0.0.1", 8888, 3000);
+  if (!tcp.ok) {
+    return {
+      ok: false,
+      message: "service active but port 8888 silent — http server died inside node, restart needed",
+    };
+  }
+  return { ok: true, message: "service active + port 8888 bound" };
+}
+
 async function runAllProbes() {
   const ts = Date.now();
   const results = {};
@@ -166,6 +210,18 @@ async function runAllProbes() {
   {
     const r = await probeSystemd("kannaka-radio.service");
     results.radio_service = { ok: r.ok, message: r.message, ts };
+  }
+
+  // 1a. radio_singleton — flag duplicate radio processes (ADR-002 Probe 1)
+  {
+    const r = await probeRadioSingleton();
+    results.radio_singleton = { ok: r.ok, message: r.message, ts };
+  }
+
+  // 1b. radio_port_alive — flag service-alive-but-port-silent (ADR-002 Probe 2)
+  {
+    const r = await probeRadioPortAlive();
+    results.radio_port_alive = { ok: r.ok, message: r.message, ts };
   }
 
   // 2. radio_now_playing
