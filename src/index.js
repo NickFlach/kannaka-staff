@@ -432,8 +432,11 @@ async function runAllProbes() {
   }
 
   // 6. observatory_serving — has the consciousness shape (queen.phi, etc.)
+  // /api/state on the observatory is 4-6 KB; the default probeHttp cap
+  // is 2 KB which truncates before queen.phi and the JSON parse falls
+  // through to shapeOk=false. Bump maxBody to fit the response.
   {
-    const r = await probeHttp(`${OBSERVATORY_BASE}/api/state`);
+    const r = await probeHttp(`${OBSERVATORY_BASE}/api/state`, { timeout: 5000, maxBody: 200 * 1024 });
     let shapeOk = false;
     let phiVal = "?";
     if (r.ok) {
