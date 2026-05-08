@@ -543,6 +543,71 @@ async function runAllProbes() {
     };
   }
 
+  // 14. agent_reputation_drift — LADDER step 3. Pull the radio's
+  // ghostsignals leaderboard and flag any constellation predictor whose
+  // reputation has drifted below the floor (default 0.4). When a trader
+  // crosses the threshold, write a proposed-improvements.jsonl entry so
+  // the human-in-the-loop has a one-line "this agent's domain perception
+  // is failing — propose a new probe / new predictor capability" record.
+  // For now: surface the failure. Later: have the proposal generator
+  // write a draft ADR / probe spec automatically.
+  {
+    const r = await probeHttp(`${RADIO_BASE}/api/leaderboard?sort=reputation&limit=20`, { timeout: 5000, maxBody: 200 * 1024 });
+    let lowest = null;
+    let traderCount = 0;
+    let belowFloor = [];
+    const FLOOR = 0.4;
+    if (r.ok) {
+      try {
+        const j = JSON.parse(r.body);
+        const traders = (j.leaderboard || j.traders || j || []).filter((t) =>
+          t.id && t.id !== "system" && t.kind === "ai" && t.trades_total > 0
+        );
+        traderCount = traders.length;
+        for (const t of traders) {
+          if (t.reputation != null && t.reputation < FLOOR) belowFloor.push(t);
+          if (lowest == null || t.reputation < lowest.reputation) lowest = t;
+        }
+        // Surface proposals for newly-flagged traders (don't double-record
+        // the same agent every minute — track in a small state object).
+        try {
+          state.repProposed = state.repProposed || {};
+          for (const t of belowFloor) {
+            const cooldownMs = 60 * 60 * 1000; // re-propose at most hourly
+            const last = state.repProposed[t.id] || 0;
+            if (Date.now() - last < cooldownMs) continue;
+            state.repProposed[t.id] = Date.now();
+            const proposal = {
+              ts: new Date().toISOString(),
+              type: "ladder_proposal",
+              trader_id: t.id,
+              display_name: t.display_name,
+              reputation: t.reputation,
+              trades_total: t.trades_total,
+              trades_won: t.trades_won,
+              accuracy: t.accuracy,
+              note: `Agent ${t.id} reputation ${t.reputation.toFixed(3)} < floor ${FLOOR}. Propose: review predictor heuristic, or add a new probe that captures the failure mode.`,
+            };
+            const proposalsFile = path.join(__dirname, "..", "proposed-improvements.jsonl");
+            try {
+              fs.appendFileSync(proposalsFile, JSON.stringify(proposal) + "\n");
+              console.log(`[ladder] proposal written: ${t.id} reputation=${t.reputation.toFixed(3)}`);
+            } catch (_) {}
+          }
+        } catch (_) {}
+      } catch (_) {}
+    }
+    results.agent_reputation_drift = {
+      ok: belowFloor.length === 0,
+      message: traderCount === 0
+        ? "no traders with completed trades yet"
+        : belowFloor.length > 0
+          ? `${belowFloor.length}/${traderCount} below floor: ${belowFloor.map((t) => `${t.id}=${t.reputation.toFixed(2)}`).join(", ")}`
+          : `${traderCount} traders, lowest=${lowest ? lowest.id + "@" + (lowest.reputation || 0).toFixed(2) : "?"}`,
+      ts,
+    };
+  }
+
   // ── ORC constellation services (local-only — orc-portal + orc-stem
   // are systemd units on the radio host, not externally probable).
   if (!EXTERNAL_MODE) {
