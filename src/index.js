@@ -532,6 +532,30 @@ async function runAllProbes() {
     };
   }
 
+  // ── ORC constellation services ─────────────────────────────
+  // Both portals were hand-launched and silently died for ~3 weeks before
+  // anyone noticed (April 15 → May 7, 2026). Now they're under systemd
+  // (orc-portal, orc-stem); these probes catch any future regression
+  // within 60s instead.
+  {
+    const sysd = await probeSystemd("orc-portal.service");
+    const tcp = sysd.ok ? await probeTcp("127.0.0.1", 3002, 3000) : { ok: false, message: "skipped (service inactive)" };
+    results.orc_portal = {
+      ok: sysd.ok && tcp.ok,
+      message: sysd.ok ? (tcp.ok ? `active, port 3002 open` : `active but ${tcp.message}`) : sysd.message,
+      ts,
+    };
+  }
+  {
+    const sysd = await probeSystemd("orc-stem.service");
+    const tcp = sysd.ok ? await probeTcp("127.0.0.1", 3001, 3000) : { ok: false, message: "skipped (service inactive)" };
+    results.orc_stem = {
+      ok: sysd.ok && tcp.ok,
+      message: sysd.ok ? (tcp.ok ? `active, port 3001 open` : `active but ${tcp.message}`) : sysd.message,
+      ts,
+    };
+  }
+
   return results;
 }
 
