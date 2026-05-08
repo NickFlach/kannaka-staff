@@ -308,42 +308,50 @@ async function probePodcastFilesPlayable() {
   return _lastPodcastResult;
 }
 
+// External observer mode: when STAFF_OBSERVER_MODE=external, skip the
+// local-only probes (systemd, pgrep, file reads, ffprobe of podcast files)
+// because they always-fail on a remote box that doesn't host the radio.
+// HTTP/icecast probes still run since they go over the public URL. This
+// lets a second Oracle box act as an out-of-process witness without the
+// dashboard being a sea of red.
+const EXTERNAL_MODE = (process.env.STAFF_OBSERVER_MODE || "").toLowerCase() === "external";
+
 async function runAllProbes() {
   const ts = Date.now();
   const results = {};
 
-  // 1. kannaka-radio.service
-  {
+  // 1. kannaka-radio.service (local-only)
+  if (!EXTERNAL_MODE) {
     const r = await probeSystemd("kannaka-radio.service");
     results.radio_service = { ok: r.ok, message: r.message, ts };
   }
 
-  // 1a. radio_singleton — flag duplicate radio processes (ADR-002 Probe 1)
-  {
+  // 1a. radio_singleton — flag duplicate radio processes (ADR-002 Probe 1, local-only)
+  if (!EXTERNAL_MODE) {
     const r = await probeRadioSingleton();
     results.radio_singleton = { ok: r.ok, message: r.message, ts };
   }
 
-  // 1b. radio_port_alive — flag service-alive-but-port-silent (ADR-002 Probe 2)
-  {
+  // 1b. radio_port_alive — flag service-alive-but-port-silent (ADR-002 Probe 2, local-only)
+  if (!EXTERNAL_MODE) {
     const r = await probeRadioPortAlive();
     results.radio_port_alive = { ok: r.ok, message: r.message, ts };
   }
 
-  // 1c. metadata_mount_alignment — ICECAST_MOUNT vs public SPA mount (ADR-002 Probe 3)
-  {
+  // 1c. metadata_mount_alignment — ICECAST_MOUNT vs public SPA mount (local-only file read)
+  if (!EXTERNAL_MODE) {
     const r = await probeMetadataMountAlignment();
     results.metadata_mount_alignment = { ok: r.ok, message: r.message, ts };
   }
 
-  // 1d. stream_metadata_advancing — title change cadence (ADR-002 Probe 4)
+  // 1d. stream_metadata_advancing — title change cadence (works external — uses icecast public URL)
   {
     const r = await probeStreamMetadataAdvancing();
     results.stream_metadata_advancing = { ok: r.ok, message: r.message, ts };
   }
 
-  // 1e. podcast_files_playable — sample-rate/bitrate envelope (ADR-002 Probe 5, hourly)
-  {
+  // 1e. podcast_files_playable — local ffprobe of podcast files
+  if (!EXTERNAL_MODE) {
     const r = await probePodcastFilesPlayable();
     results.podcast_files_playable = { ok: r.ok, message: r.message, ts };
   }
@@ -393,8 +401,8 @@ async function runAllProbes() {
     };
   }
 
-  // 5. observatory_service
-  {
+  // 5. observatory_service (local-only)
+  if (!EXTERNAL_MODE) {
     const r = await probeSystemd("kannaka-observatory.service");
     results.observatory_service = { ok: r.ok, message: r.message, ts };
   }
@@ -443,14 +451,14 @@ async function runAllProbes() {
     };
   }
 
-  // 7. swarm_serve_service
-  {
+  // 7. swarm_serve_service (local-only)
+  if (!EXTERNAL_MODE) {
     const r = await probeSystemd("kannaka-swarm-serve.service");
     results.swarm_serve_service = { ok: r.ok, message: r.message, ts };
   }
 
-  // 8. hrm_size — alert if >HRM_SIZE_ALERT_MB
-  {
+  // 8. hrm_size — alert if >HRM_SIZE_ALERT_MB (local-only file stat)
+  if (!EXTERNAL_MODE) {
     try {
       const stat = fs.statSync(HRM_PATH);
       const sizeMB = stat.size / (1024 * 1024);
@@ -471,10 +479,8 @@ async function runAllProbes() {
     results.nats_reachable = { ok: r.ok, message: r.message, ts };
   }
 
-  // 10. hrm_memory_count — read from cached status. Alert when > 1500
-  // because that's where kannaka ask starts silent-failing on the
-  // bloated medium (the 2026-05-02 incident).
-  {
+  // 10. hrm_memory_count — local cache read; only on the host that owns it.
+  if (!EXTERNAL_MODE) {
     try {
       const cachePath = path.join(process.env.HOME || "/home/opc", ".kannaka", "status-cache.json");
       if (fs.existsSync(cachePath)) {
@@ -505,8 +511,9 @@ async function runAllProbes() {
     };
   }
 
-  // 12. disk_space — Oracle's root filesystem. Alert under 5 GB free.
-  // Music dir + HRM file + journal logs + album mp3s grow fast.
+  // 12. disk_space — local df. In external mode this reports the OBSERVER's
+  // disk, not the radio host's, which is still a useful "the watcher box is
+  // healthy" signal — keep it on. Threshold remains 5 GB.
   {
     const r = await new Promise((resolve) => {
       exec("df -BM --output=avail / | tail -1", { timeout: 5000 }, (err, stdout) => {
@@ -532,12 +539,9 @@ async function runAllProbes() {
     };
   }
 
-  // ── ORC constellation services ─────────────────────────────
-  // Both portals were hand-launched and silently died for ~3 weeks before
-  // anyone noticed (April 15 → May 7, 2026). Now they're under systemd
-  // (orc-portal, orc-stem); these probes catch any future regression
-  // within 60s instead.
-  {
+  // ── ORC constellation services (local-only — orc-portal + orc-stem
+  // are systemd units on the radio host, not externally probable).
+  if (!EXTERNAL_MODE) {
     const sysd = await probeSystemd("orc-portal.service");
     const tcp = sysd.ok ? await probeTcp("127.0.0.1", 3002, 3000) : { ok: false, message: "skipped (service inactive)" };
     results.orc_portal = {
@@ -546,7 +550,7 @@ async function runAllProbes() {
       ts,
     };
   }
-  {
+  if (!EXTERNAL_MODE) {
     const sysd = await probeSystemd("orc-stem.service");
     const tcp = sysd.ok ? await probeTcp("127.0.0.1", 3001, 3000) : { ok: false, message: "skipped (service inactive)" };
     results.orc_stem = {
