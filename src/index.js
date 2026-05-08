@@ -344,8 +344,9 @@ async function runAllProbes() {
     results.metadata_mount_alignment = { ok: r.ok, message: r.message, ts };
   }
 
-  // 1d. stream_metadata_advancing — title change cadence (works external — uses icecast public URL)
-  {
+  // 1d. stream_metadata_advancing — needs icecast status-json on :8000
+  // which is firewalled to localhost on the radio host. Local-only.
+  if (!EXTERNAL_MODE) {
     const r = await probeStreamMetadataAdvancing();
     results.stream_metadata_advancing = { ok: r.ok, message: r.message, ts };
   }
