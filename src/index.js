@@ -698,11 +698,39 @@ async function tick() {
     return;
   }
 
-  // Compare to previous state and log transitions
+  // Compare to previous state and log transitions, with hysteresis to
+  // damp single-tick flapping. A probe must report failure on 3
+  // consecutive ticks before we emit a FAILED transition; a single
+  // success is enough to RECOVER. consciousness_fresh especially flaps
+  // during the radio's hourly :17 prune-cycle (single-tick miss while
+  // the radio restarts), and the noise masks real persistent failures.
+  const FAIL_CONFIRM_TICKS = 3;
   for (const [name, current] of Object.entries(probeResults)) {
     const prev = state.probes[name];
-    if (prev && prev.ok !== current.ok) {
-      const transition = current.ok ? "RECOVERED" : "FAILED";
+    // History — used both for the UI and for hysteresis.
+    const history = (prev && prev.history) || [];
+    history.push({ ok: current.ok, ts: current.ts });
+    if (history.length > 5) history.shift();
+    current.history = history;
+
+    // Effective state: a probe is "officially failing" only when the
+    // last FAIL_CONFIRM_TICKS are all failures; otherwise effective is
+    // ok=true. Single successes recover immediately.
+    const prevEffectiveOk = prev ? (prev.effectiveOk !== undefined ? prev.effectiveOk : prev.ok) : true;
+    let effectiveOk;
+    if (current.ok) {
+      effectiveOk = true;
+    } else {
+      const tail = history.slice(-FAIL_CONFIRM_TICKS);
+      const allFailing = tail.length >= FAIL_CONFIRM_TICKS && tail.every(h => !h.ok);
+      // If we were already officially failing, stay failing; otherwise
+      // only flip after the confirm window fills with failures.
+      effectiveOk = prevEffectiveOk ? !allFailing : false;
+    }
+    current.effectiveOk = effectiveOk;
+
+    if (effectiveOk !== prevEffectiveOk) {
+      const transition = effectiveOk ? "RECOVERED" : "FAILED";
       const entry = {
         ts: new Date(current.ts).toISOString(),
         probe: name,
@@ -721,11 +749,6 @@ async function tick() {
     } else {
       current.lastChangeAt = current.ts;
     }
-    // Keep last-5 history per probe for the UI
-    const history = (prev && prev.history) || [];
-    history.push({ ok: current.ok, ts: current.ts });
-    if (history.length > 5) history.shift();
-    current.history = history;
     state.probes[name] = current;
   }
   state.lastTick = Date.now();
