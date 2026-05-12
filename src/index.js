@@ -43,6 +43,7 @@ const url = require("url");
 const crypto = require("crypto");
 
 const { bootGrowth } = require("./staff/growth");
+const { bootCurator } = require("./staff/curator");
 
 // ── Config ──────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || process.argv.includes("--port") ? process.argv[process.argv.indexOf("--port") + 1] : "8889", 10) || 8889;
@@ -941,18 +942,35 @@ async function refresh() {
         gv.innerHTML = '<div class="empty">' + (gr.error || 'growth offline') + '</div>';
       }
     } catch (_) {}
-    // Curator panel — least-recently-played albums first
+    // Curator panel — pull classification summary from /api/curator
+    // (the Curator role) and the per-album list from /api/album-staleness
+    // (the watcher's read-only helper that pre-existed the role).
     try {
-      const cur = await fetch('/api/album-staleness').then(r => r.json());
+      const [cu, cur] = await Promise.all([
+        fetch('/api/curator').then(r => r.json()).catch(() => ({ ok: false })),
+        fetch('/api/album-staleness').then(r => r.json()),
+      ]);
       const stale = document.getElementById('staleness');
+      let header = '';
+      if (cu.ok && cu.counts) {
+        const c = cu.counts;
+        header =
+          '<div class="alert" style="border-left-color: var(--vio); background: rgba(167,139,250,0.04);">'
+          + '<strong>roles classification</strong> · '
+          + '<span style="color: var(--ok)">fresh ' + (c.fresh||0) + '</span> · '
+          + '<span style="color: #fbbf24">aging ' + (c.aging||0) + '</span> · '
+          + '<span style="color: var(--fail)">starving ' + (c.starving||0) + '</span>'
+          + (c.never ? ' · <span style="color: var(--fail)">never ' + c.never + '</span>' : '')
+          + '</div>';
+      }
       if (cur.ok && cur.albums && cur.albums.length > 0) {
-        stale.innerHTML = cur.albums.slice(0, 12).map(c => {
+        stale.innerHTML = header + cur.albums.slice(0, 12).map(c => {
           const ago = c.ageMs == null ? '<span style="color: var(--fail)">never (in last ' + (cur.historyLen||0) + ')</span>' : fmtAge(c.ageMs) + ' ago';
           const plays = c.playsInWindow ? c.playsInWindow + 'x' : '0x';
           return '<div class="alert" style="border-left-color: ' + (c.ageMs == null ? 'var(--fail)' : c.ageMs > 21600000 ? '#fbbf24' : 'var(--ok)') + ';"><strong>' + c.album + '</strong> · last: ' + ago + ' · plays in window: ' + plays + '</div>';
         }).join('');
       } else {
-        stale.innerHTML = '<div class="empty">' + (cur.message || 'no staleness data') + '</div>';
+        stale.innerHTML = header + '<div class="empty">' + (cur.message || 'no staleness data') + '</div>';
       }
     } catch (_) {}
     document.getElementById('meta').textContent =
@@ -1021,6 +1039,11 @@ const server = http.createServer((req, res) => {
   if (req.url === "/api/growth") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(growth ? { ok: true, ...growth.getState() } : { ok: false, error: "growth not online (EXTERNAL_MODE?)" }));
+    return;
+  }
+  if (req.url === "/api/curator") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(curator ? { ok: true, ...curator.getState() } : { ok: false, error: "curator not online" }));
     return;
   }
   // ── Operations console: write actions ───────────────────────
@@ -1099,6 +1122,17 @@ if (!EXTERNAL_MODE) {
   }
 } else {
   console.log("[staff] growth disabled (EXTERNAL_MODE)");
+}
+
+// ── Boot Curator (album-staleness + empty-album watch) ──────
+// Safe in EXTERNAL_MODE — only needs HTTP access to the radio.
+let curator = null;
+try {
+  curator = bootCurator({ radioBase: RADIO_BASE, alertsFile: ALERTS_FILE });
+  const cs = curator.getState();
+  console.log(`[staff] curator online — tick ${Math.round(cs.cfg.tickMs / 60000)}m · starving ≥ ${Math.round(cs.cfg.starvingMs / 3600000)}h`);
+} catch (e) {
+  console.warn(`[staff] curator boot failed: ${e.message}`);
 }
 
 server.listen(PORT, () => {
