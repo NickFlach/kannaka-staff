@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 /**
- * kannaka-staff — Phase 1: Watcher
+ * kannaka-staff — Phase 1: Watcher + Growth
  *
- * Single-file watcher that probes every constellation surface every 60s,
- * logs state transitions to a JSONL alert file, and serves a small
- * status dashboard on port 8889 (configurable). Stdlib-only — no npm
- * deps, ships clean to Oracle alongside kannaka-radio.
+ * Single Node.js service hosting the staff crew. Each role lives in
+ * src/staff/<role>/ and boots from this entry. Two crew members live:
+ *
+ *   - Watcher (this file)  — 60s tick, 18+ probes, alert log + dashboard
+ *   - Growth (src/staff/growth) — 15min tick, schedules dream
+ *     consolidation, watches HRM size, persists last-dream state
+ *
+ * Probes (the health checks):
  *
  * Probes (the health checks):
  *   - radio_service       — kannaka-radio.service is active (systemctl)
@@ -21,6 +25,10 @@
  *
  * State changes (ok→fail, fail→ok) are logged to alerts.jsonl and
  * surfaced on the dashboard. The dashboard polls /api/state every 10s.
+ *
+ * Growth emits its own transitions (GROWTH_DREAM_START, _DONE,
+ * _FAILED, GROWTH_HRM_BLOATED, GROWTH_HRM_RECOVERED) into the same
+ * alerts.jsonl, so the operator only watches one stream.
  */
 
 "use strict";
@@ -33,6 +41,8 @@ const { exec, execFile } = require("child_process");
 const net = require("net");
 const url = require("url");
 const crypto = require("crypto");
+
+const { bootGrowth } = require("./staff/growth");
 
 // ── Config ──────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || process.argv.includes("--port") ? process.argv[process.argv.indexOf("--port") + 1] : "8889", 10) || 8889;
@@ -773,11 +783,17 @@ async function handleAction(action, query) {
       return { ok: r.ok, album, duration, status: r.status, body: r.body };
     }
     case "trigger-dream": {
-      // Run dream lite in the background — return immediately so
-      // the dashboard isn't blocked. It can take 5+ min on a bloated
-      // medium; the watcher's existing probes will catch the result.
+      // Legacy fire-and-forget. Prefer "growth-dream" so the
+      // result lands in growth-state.json + alerts.jsonl.
       exec("/home/opc/kannaka-memory/target/release/kannaka dream --mode lite", { timeout: 900_000 }, () => {});
       return { ok: true, kind: "dream", note: "spawned in background; watch hrm_size + observatory_serving probes" };
+    }
+    case "growth-dream": {
+      // Route through Growth so the dream is tracked (in-flight guard,
+      // state persistence, alerts.jsonl transition, dashboard timeline).
+      if (!growth) return { ok: false, error: "growth not online" };
+      const mode = (query.mode === "deep" || query.mode === "lite") ? query.mode : undefined;
+      return growth.requestDream(mode, "manual request from dashboard");
     }
     default:
       return { ok: false, error: `unknown action: ${action}` };
@@ -852,6 +868,14 @@ h1 { font-family: Orbitron, sans-serif; font-size: 1.4rem; color: var(--vio); ma
   <div id="alerts"><div class="empty">no recent transitions</div></div>
 </div>
 <div class="alerts">
+  <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">GROWTH — HRM & DREAM CONSOLIDATION</h3>
+  <div id="growth"><div class="empty">loading…</div></div>
+  <div style="margin-top: 8px; display: flex; gap: 8px;">
+    <button onclick="act('growth-dream', { mode: 'lite' })" class="btn">🌙 dream lite (tracked)</button>
+    <button onclick="confirmAct('growth-dream', { mode: 'deep' })" class="btn warn">🌙🌙 dream deep</button>
+  </div>
+</div>
+<div class="alerts">
   <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">CURATOR — ALBUM STALENESS</h3>
   <div id="staleness"><div class="empty">loading…</div></div>
 </div>
@@ -887,6 +911,36 @@ async function refresh() {
         '<div class="alert ' + e.transition + '"><span class="when">' + e.ts + '</span><strong>' + e.transition + '</strong> ' + e.probe + ' — ' + (e.message||'').replace(/</g,'&lt;') + '</div>'
       ).join('');
     }
+    // Growth panel — HRM size, last dream, recent dream timeline.
+    try {
+      const gr = await fetch('/api/growth').then(r => r.json());
+      const gv = document.getElementById('growth');
+      if (gr.ok) {
+        const hrm = gr.hrm || {};
+        const size = hrm.sizeMB != null ? hrm.sizeMB.toFixed(1) + ' MB' : '(unreadable)';
+        const mem = hrm.memoryCount != null ? hrm.memoryCount + ' memories' : 'mem ?';
+        const inFlight = gr.inFlight
+          ? '<span style="color: var(--vio)">⏳ ' + gr.inFlight.mode + ' dream in flight (' + Math.round((now - gr.inFlight.startedAt)/1000) + 's)</span>'
+          : '';
+        const lastD = gr.lastDream
+          ? '<div class="alert ' + (gr.lastDream.ok ? 'RECOVERED' : '') + '" style="border-left-color: ' + (gr.lastDream.ok ? 'var(--ok)' : 'var(--fail)') + ';"><span class="when">' + new Date(gr.lastDream.ts).toLocaleTimeString() + '</span><strong>last:</strong> ' + (gr.lastDream.message || '') + '</div>'
+          : '<div class="empty">no dream recorded yet</div>';
+        const soft = gr.cfg && gr.cfg.hrmSoftMB, hard = gr.cfg && gr.cfg.hrmHardMB;
+        const sizeColor = hrm.sizeMB != null
+          ? (hrm.sizeMB >= hard ? 'var(--fail)' : (hrm.sizeMB >= soft ? '#fbbf24' : 'var(--ok)'))
+          : 'var(--dim)';
+        gv.innerHTML =
+          '<div class="alert" style="border-left-color: ' + sizeColor + ';"><strong>HRM</strong> · ' + size + ' · ' + mem + ' · thresholds ' + soft + '/' + hard + ' MB ' + inFlight + '</div>'
+          + lastD
+          + (gr.dreamHistory && gr.dreamHistory.length > 1
+              ? '<div style="color: var(--dim); font-size: 0.78rem; margin-top: 8px;">history: '
+                + gr.dreamHistory.slice(0, 6).map(d => (d.ok ? '✓' : '✗') + d.mode[0]).join(' ')
+                + '</div>'
+              : '');
+      } else {
+        gv.innerHTML = '<div class="empty">' + (gr.error || 'growth offline') + '</div>';
+      }
+    } catch (_) {}
     // Curator panel — least-recently-played albums first
     try {
       const cur = await fetch('/api/album-staleness').then(r => r.json());
@@ -924,9 +978,9 @@ async function act(action, params) {
   }
 }
 
-function confirmAct(action) {
-  if (!confirm('Run ' + action + ' on the radio? This will interrupt playback.')) return;
-  act(action);
+function confirmAct(action, params) {
+  if (!confirm('Run ' + action + (params ? ' ' + JSON.stringify(params) : '') + '? This may interrupt service.')) return;
+  act(action, params);
 }
 </script>
 </body></html>`;
@@ -962,6 +1016,11 @@ const server = http.createServer((req, res) => {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: e.message }));
       });
+    return;
+  }
+  if (req.url === "/api/growth") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(growth ? { ok: true, ...growth.getState() } : { ok: false, error: "growth not online (EXTERNAL_MODE?)" }));
     return;
   }
   // ── Operations console: write actions ───────────────────────
@@ -1026,6 +1085,21 @@ const server = http.createServer((req, res) => {
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("404");
 });
+
+// ── Boot Growth (medium maintenance) ────────────────────────
+// Disabled in EXTERNAL_MODE (the radio host owns the HRM — a remote
+// observer can't see the file and shouldn't be scheduling dreams).
+let growth = null;
+if (!EXTERNAL_MODE) {
+  try {
+    growth = bootGrowth({ hrmPath: HRM_PATH, alertsFile: ALERTS_FILE });
+    console.log(`[staff] growth online — tick ${Math.round(growth.getState().cfg.tickMs / 60000)}m · HRM thresholds ${growth.getState().cfg.hrmSoftMB}/${growth.getState().cfg.hrmHardMB} MB`);
+  } catch (e) {
+    console.warn(`[staff] growth boot failed: ${e.message}`);
+  }
+} else {
+  console.log("[staff] growth disabled (EXTERNAL_MODE)");
+}
 
 server.listen(PORT, () => {
   console.log(`[staff] listening on :${PORT}`);

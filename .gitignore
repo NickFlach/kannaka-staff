@@ -1,3 +1,5 @@
 node_modules/
 .env
 build/
+growth-state.json
+alerts.jsonl
