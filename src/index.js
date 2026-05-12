@@ -44,6 +44,7 @@ const crypto = require("crypto");
 
 const { bootGrowth } = require("./staff/growth");
 const { bootCurator } = require("./staff/curator");
+const { bootDistributor } = require("./staff/distributor");
 
 // ── Config ──────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || process.argv.includes("--port") ? process.argv[process.argv.indexOf("--port") + 1] : "8889", 10) || 8889;
@@ -796,6 +797,13 @@ async function handleAction(action, query) {
       const mode = (query.mode === "deep" || query.mode === "lite") ? query.mode : undefined;
       return growth.requestDream(mode, "manual request from dashboard");
     }
+    case "distributor-publish": {
+      if (!distributor) return { ok: false, error: "distributor not online" };
+      const configPath = (query.config || "").toString();
+      const skip = (query.skip || "").toString();
+      if (!configPath) return { ok: false, error: "missing ?config=<path-to-album-config.json>" };
+      return distributor.requestPublish({ configPath, skip });
+    }
     default:
       return { ok: false, error: `unknown action: ${action}` };
   }
@@ -1046,6 +1054,16 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(curator ? { ok: true, ...curator.getState() } : { ok: false, error: "curator not online" }));
     return;
   }
+  if (req.url === "/api/distributor") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(distributor ? { ok: true, ...distributor.getState() } : { ok: false, error: "distributor not online (EXTERNAL_MODE?)" }));
+    return;
+  }
+  if (req.url === "/api/distributor/log") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(distributor ? distributor.getLog() : { ok: false, error: "distributor not online" }));
+    return;
+  }
   // ── Operations console: write actions ───────────────────────
   // Each action wraps a known operational pattern. Authentication
   // model: if STAFF_SHARED_SECRET is configured (production), require
@@ -1133,6 +1151,24 @@ try {
   console.log(`[staff] curator online — tick ${Math.round(cs.cfg.tickMs / 60000)}m · starving ≥ ${Math.round(cs.cfg.starvingMs / 3600000)}h`);
 } catch (e) {
   console.warn(`[staff] curator boot failed: ${e.message}`);
+}
+
+// ── Boot Distributor (release-album pipeline runner) ────────
+// Disabled in EXTERNAL_MODE — Distributor expects the
+// kannaka-radio scripts/release-album.sh to live on the same host
+// (it scp's to Oracle and restarts the radio service).
+let distributor = null;
+if (!EXTERNAL_MODE) {
+  try {
+    distributor = bootDistributor({ alertsFile: ALERTS_FILE });
+    const ds = distributor.getState();
+    const scriptOk = require("fs").existsSync(ds.cfg.releaseScript);
+    console.log(`[staff] distributor online — release script ${scriptOk ? "ok" : "MISSING"} at ${ds.cfg.releaseScript} · timeout ${Math.round(ds.cfg.jobTimeoutMs / 60000)}m`);
+  } catch (e) {
+    console.warn(`[staff] distributor boot failed: ${e.message}`);
+  }
+} else {
+  console.log("[staff] distributor disabled (EXTERNAL_MODE)");
 }
 
 server.listen(PORT, () => {
