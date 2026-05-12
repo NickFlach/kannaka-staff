@@ -50,6 +50,12 @@ const DEFAULTS = {
   STARVING_MS: 48 * 60 * 60 * 1000,   // 48 h
   AGING_MS: 12 * 60 * 60 * 1000,      // 12 h (used for color-coding, no alert)
   HISTORY_LIMIT: 200,
+  // Don't fire NEVER_PLAYED / STARVING alerts until the radio's history
+  // window has at least this many entries. A fresh radio restart starts
+  // with 0 history — without this guard Curator's first tick after a
+  // restart would emit a NEVER_PLAYED alert for *every* registered
+  // album (saw 23/23 fire on 2026-05-12).
+  MIN_HISTORY_FOR_ALERTS: 30,
 };
 
 function readEnvMs(name, fallback) {
@@ -141,6 +147,7 @@ function bootCurator(deps) {
     starvingMs: readEnvMs("CURATOR_STARVING_MS", DEFAULTS.STARVING_MS),
     agingMs: readEnvMs("CURATOR_AGING_MS", DEFAULTS.AGING_MS),
     historyLimit: parseInt(process.env.CURATOR_HISTORY_LIMIT || "", 10) || DEFAULTS.HISTORY_LIMIT,
+    minHistoryForAlerts: parseInt(process.env.CURATOR_MIN_HISTORY_FOR_ALERTS || "", 10) || DEFAULTS.MIN_HISTORY_FOR_ALERTS,
     enabled: process.env.CURATOR_ENABLED !== "false",
   };
 
@@ -203,6 +210,11 @@ function bootCurator(deps) {
       return;
     }
     c.lastSnapshot = snap;
+    // Gate alerting until the radio has played enough tracks for the
+    // history window to actually mean something. Classification still
+    // updates so the dashboard reflects current state; only the
+    // alerts.jsonl writes wait for signal-over-noise.
+    const alertsActive = snap.historyLen >= cfg.minHistoryForAlerts;
     for (const album of snap.albums) {
       const next = classify(album);
       const prev = c.classification[album.album];
@@ -210,15 +222,22 @@ function bootCurator(deps) {
       // Transitions worth alerting on. We don't fire on every reclassify —
       // only on the two big shifts the operator actually cares about:
       // entering starving (or never-played), and leaving starving.
-      if (next === "starving") {
-        const hrs = Math.round(album.ageMs / 3600000);
-        logAlert("CURATOR_ALBUM_STARVING", `"${album.album}" — ${hrs}h since last play (plays in window: ${album.playsInWindow})`);
-      } else if (next === "never" && prev !== "never") {
-        logAlert("CURATOR_ALBUM_NEVER_PLAYED", `"${album.album}" registered but absent from last ${snap.historyLen} tracks — check that files exist`);
-      } else if (prev === "starving" && next !== "starving") {
-        logAlert("CURATOR_ALBUM_REFRESHED", `"${album.album}" back in rotation`);
+      if (alertsActive) {
+        if (next === "starving") {
+          const hrs = Math.round(album.ageMs / 3600000);
+          logAlert("CURATOR_ALBUM_STARVING", `"${album.album}" — ${hrs}h since last play (plays in window: ${album.playsInWindow})`);
+        } else if (next === "never" && prev !== "never") {
+          logAlert("CURATOR_ALBUM_NEVER_PLAYED", `"${album.album}" registered but absent from last ${snap.historyLen} tracks — check that files exist`);
+        } else if (prev === "starving" && next !== "starving") {
+          logAlert("CURATOR_ALBUM_REFRESHED", `"${album.album}" back in rotation`);
+        }
       }
       c.classification[album.album] = next;
+    }
+    if (!alertsActive && Object.keys(c.classification).length > 0 && snap.historyLen === 0) {
+      // First-tick after a fresh restart: print one info line so the
+      // operator knows Curator is alive but silent on purpose.
+      console.log(`[curator] tick · history empty (${snap.albums.length} albums known) — alerts suppressed until ≥ ${cfg.minHistoryForAlerts} plays`);
     }
     persist();
   }
