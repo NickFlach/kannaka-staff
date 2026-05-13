@@ -45,6 +45,11 @@ const crypto = require("crypto");
 const { bootGrowth } = require("./staff/growth");
 const { bootCurator } = require("./staff/curator");
 const { bootDistributor } = require("./staff/distributor");
+const { bootCreator } = require("./staff/creator");
+const { bootMarketer } = require("./staff/marketer");
+const { bootVoice } = require("./staff/voice");
+const { bootEar } = require("./staff/ear");
+const { bootStoryteller } = require("./staff/storyteller");
 
 // ── Config ──────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || process.argv.includes("--port") ? process.argv[process.argv.indexOf("--port") + 1] : "8889", 10) || 8889;
@@ -804,6 +809,14 @@ async function handleAction(action, query) {
       if (!configPath) return { ok: false, error: "missing ?config=<path-to-album-config.json>" };
       return distributor.requestPublish({ configPath, skip });
     }
+    case "creator-request": {
+      if (!creator) return { ok: false, error: "creator not online" };
+      return creator.requestCreate(query);
+    }
+    case "marketer-post": {
+      if (!marketer) return { ok: false, error: "marketer not online" };
+      return marketer.postMessage(query);
+    }
     default:
       return { ok: false, error: `unknown action: ${action}` };
   }
@@ -1064,6 +1077,31 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(distributor ? distributor.getLog() : { ok: false, error: "distributor not online" }));
     return;
   }
+  if (req.url === "/api/creator") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(creator ? { ok: true, ...creator.getState() } : { ok: false, error: "creator not online" }));
+    return;
+  }
+  if (req.url === "/api/marketer") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(marketer ? { ok: true, ...marketer.getState() } : { ok: false, error: "marketer not online (EXTERNAL_MODE?)" }));
+    return;
+  }
+  if (req.url === "/api/voice") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(voice ? { ok: true, ...voice.getState() } : { ok: false, error: "voice not online" }));
+    return;
+  }
+  if (req.url === "/api/ear") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(ear ? { ok: true, ...ear.getState() } : { ok: false, error: "ear not online" }));
+    return;
+  }
+  if (req.url === "/api/storyteller") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(storyteller ? { ok: true, ...storyteller.getState() } : { ok: false, error: "storyteller not online" }));
+    return;
+  }
   // ── Operations console: write actions ───────────────────────
   // Each action wraps a known operational pattern. Authentication
   // model: if STAFF_SHARED_SECRET is configured (production), require
@@ -1169,6 +1207,61 @@ if (!EXTERNAL_MODE) {
   }
 } else {
   console.log("[staff] distributor disabled (EXTERNAL_MODE)");
+}
+
+// ── Boot Creator (generation dispatcher) ────────────────────
+let creator = null;
+try {
+  creator = bootCreator({ radioBase: RADIO_BASE, alertsFile: ALERTS_FILE });
+  console.log(`[staff] creator online — kinds: oration, image (track via Distributor)`);
+} catch (e) {
+  console.warn(`[staff] creator boot failed: ${e.message}`);
+}
+
+// ── Boot Marketer (social fan-out wrapper) ──────────────────
+// Disabled in EXTERNAL_MODE — requires the radio repo locally.
+let marketer = null;
+if (!EXTERNAL_MODE) {
+  try {
+    marketer = bootMarketer({ alertsFile: ALERTS_FILE });
+    const ms = marketer.getState();
+    const radioOk = require("fs").existsSync(require("path").join(ms.cfg.radioRepo, "server/broadcasters"));
+    console.log(`[staff] marketer online — broadcasters ${radioOk ? "ok" : "MISSING"} at ${ms.cfg.radioRepo}/server/broadcasters`);
+  } catch (e) {
+    console.warn(`[staff] marketer boot failed: ${e.message}`);
+  }
+} else {
+  console.log("[staff] marketer disabled (EXTERNAL_MODE)");
+}
+
+// ── Boot Voice (talk-segment lock observer) ─────────────────
+let voice = null;
+try {
+  voice = bootVoice({ radioBase: RADIO_BASE, alertsFile: ALERTS_FILE });
+  const vs = voice.getState();
+  console.log(`[staff] voice online — tick ${Math.round(vs.cfg.tickMs / 60000)}m · stuck threshold ${Math.round(vs.cfg.stuckMs / 60000)}m`);
+} catch (e) {
+  console.warn(`[staff] voice boot failed: ${e.message}`);
+}
+
+// ── Boot Ear (stream silence detector) ──────────────────────
+let ear = null;
+try {
+  ear = bootEar({ streamUrl: STREAM_URL, alertsFile: ALERTS_FILE });
+  const es = ear.getState();
+  console.log(`[staff] ear online — tick ${Math.round(es.cfg.tickMs / 60000)}m · sample ${es.cfg.sampleBytes}B · confirm ${es.cfg.confirmTicks}t`);
+} catch (e) {
+  console.warn(`[staff] ear boot failed: ${e.message}`);
+}
+
+// ── Boot Storyteller (showcase landscape observer) ──────────
+let storyteller = null;
+try {
+  storyteller = bootStoryteller({ radioBase: RADIO_BASE, alertsFile: ALERTS_FILE });
+  const ss = storyteller.getState();
+  console.log(`[staff] storyteller online — tick ${Math.round(ss.cfg.tickMs / 60000)}m`);
+} catch (e) {
+  console.warn(`[staff] storyteller boot failed: ${e.message}`);
 }
 
 server.listen(PORT, () => {
