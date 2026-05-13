@@ -1,9 +1,9 @@
-# ADR-002 — closed loops via in-process event bus
+# ADR-003 — closed loops via in-process event bus
 
 **Status:** Accepted
 **Date:** 2026-05-13
 **Supersedes:** none
-**Refines:** ADR-001 (scope and roles)
+**Refines:** ADR-001 (scope and roles); coexists with ADR-002 (stream-integrity probes).
 
 ## The shape of the next problem
 
@@ -130,4 +130,4 @@ the staff is not a rules engine and we are not building one.
      is fine; with ten we need a per-action enable flag + audit
      trail. Defer until we have three or more.
 
-— ADR-002
+— ADR-003

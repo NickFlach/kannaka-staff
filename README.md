@@ -15,50 +15,49 @@ focused on the work.
 
 ## Status
 
-**Watcher Phase 1 deployed** on Oracle as `kannaka-staff.service` —
-`src/index.js` ticks every 60s, runs the probe set below, surfaces
-failures on the dashboard at `:8889/`, and writes a transition log to
-`alerts.jsonl`. Other roles (Distributor, Curator, Storyteller, etc.)
-follow the same systemd-supervised pattern as they're built out.
+All nine ADR-001 roles deployed on Oracle as `kannaka-staff.service`
+in a single Node process, plus two closed-loop auto-actions and a
+public dashboard.
 
-## Watcher probes (May 2026)
+- **Public dashboard:** `https://staff.ninja-portal.com/` (basic-auth)
+- **Local dashboard:** `http://<oracle>:8889/` (SSH tunnel)
+- **Source:** `src/index.js` + `src/staff/<role>/`
+- **State files:** `*-state.json` next to `alerts.jsonl`
 
-Each probe runs once per 60s tick. All return `{ ok, message, ts }`,
-roll up to a single dashboard view, and trigger on transitions.
+### The crew
 
-**Radio**
-- `radio_service` — `kannaka-radio.service` is `active` per systemd
-- `radio_singleton` — exactly one `node server/index.js --port 8888`
-  process (catches PM2/systemd ghost-running)
-- `radio_port_alive` — service active **and** TCP 8888 accepts
-- `metadata_mount_alignment` — `/home/opc/run-radio.sh` exports
-  `ICECAST_MOUNT=/stream` (matches public mount)
-- `stream_metadata_advancing` — `/stream` Now-Playing title changes
-  within `TRACK_STALL_MS` while listeners > 0
-- `podcast_files_playable` — hourly ffprobe of GSP-NNN-*.mp3 confirms
-  44.1 kHz / ≤ 192 kbps (the pipe-fed ffmpeg's envelope)
-- `radio_now_playing` — `/api/now-playing` 200s with non-empty title
-- `radio_track_advancing` — title changed within `TRACK_STALL_MS`
-- `stream_responsive` — first kilobyte of `/stream` arrives in <4s
+| Role | Cadence | What it does |
+| --- | --- | --- |
+| Watcher | 60s tick | 19 probes across radio + observatory + swarm + ORC; hysteresis-damped alerts (3-fail confirm / 1-success recover); operator action buttons (restart radio, trigger oration, etc.) |
+| Growth | 15-min tick | Watches HRM size + memory count; auto-fires `kannaka dream --mode lite` on cadence (12h normal, 6h soft >70MB, immediately >95MB) |
+| Curator | 30-min tick | Classifies each album fresh / aging / starving / never from radio history; alerts on transitions; publishes `KANNAKA.staff.album.starving` events |
+| Distributor | event-driven | Wraps `scripts/release-album.sh` for end-to-end album publishing; `POST /action/distributor-publish?config=<path>` |
+| Creator | event-driven | Generation dispatcher: `kind=oration` → radio `/api/oration/now`; `kind=image` → OBC `/artifacts/generate-image`. Track gen still goes through Distributor |
+| Marketer | event-driven | Wraps the radio's broadcasters/ via child-process; `POST /action/marketer-post?text=...&link=...` fans to Bluesky / Mastodon / Telegram / Nostr / YouTube |
+| Voice | 90s tick | Observes `_inTalkSegment` lock; alerts + publishes `KANNAKA.staff.voice.lock.stuck` past 5-min threshold |
+| Ear | 2-min tick | Samples 8KB of `/stream`, variance-based silence detector; publishes `KANNAKA.staff.stream.silent` after 2 consecutive silent samples |
+| Storyteller | 5-min tick | Surfaces current album/block/override + minutes-to-next-showcase (11 AM + 9 PM CST DAILY_SHOWCASES) |
 
-**Constellation**
-- `observatory_service` — `kannaka-observatory.service` active
-- `observatory_serving` — `:3334/api/state` returns canonical
-  consciousness shape (queen.phi etc.)
-- `consciousness_fresh` — `KANNAKA.consciousness` publish observed
-  within 12h
-- `swarm_serve_service` — `kannaka-swarm.service` active
-- `nats_reachable` — TCP `:4222` open
-- `hrm_size` — `~/.kannaka/kannaka.hrm` under guardrail size
-- `hrm_memory_count` — total memories under prune-cron threshold
-- `obc_reachable` — OpenBotCity heartbeat 200
-- `disk_space` — root partition not full
-- `anthropic_reachable` — `api.anthropic.com/v1/models` not down
+### Closed loops (per ADR-003)
 
-**ORC** (added 2026-05-08 after a silent-died incident — both portals
-went dark for ~3 weeks before anyone noticed)
-- `orc_portal` — `orc-portal.service` active **and** TCP `:3002` open
-- `orc_stem` — `orc-stem.service` active **and** TCP `:3001` open
+Two authorized auto-actions are armed, each with a documented predicate
+and a rate-limit. Both write `AUTO_*` transitions into `alerts.jsonl`.
+
+| Trigger | Action | Rate-limit |
+| --- | --- | --- |
+| `KANNAKA.staff.stream.silent` (Ear) or `KANNAKA.staff.voice.lock.stuck` (Voice) | `sudo systemctl restart kannaka-radio` | 30 min, **shared cooldown bucket** (co-occurring failures don't double-restart) |
+| `KANNAKA.staff.album.starving` (Curator) | `POST /api/album/showcase?album=<oldest-aged>&duration=20` | 24h **global** cooldown (not per-album — five starving albums must take turns) |
+
+Both are disabled cleanly under `EXTERNAL_MODE` (no sudo on remote
+observers). Operator can fire either manually from the dashboard.
+
+### Observability
+
+- `GET /api/state` — Watcher probes, current snapshot
+- `GET /api/alerts` — last 100 transitions
+- `GET /api/<role>` — per-role state (one per role)
+- `GET /api/bus` — last 100 staffBus events (closed-loop traffic visible in real time)
+- `GET /api/album-staleness` — Curator's read-only audit helper
 
 ## Read first
 
@@ -67,6 +66,9 @@ went dark for ~3 weeks before anyone noticed)
 - [`docs/adr/ADR-002-duplicate-process-and-stream-integrity-probes.md`](docs/adr/ADR-002-duplicate-process-and-stream-integrity-probes.md) —
   why the radio probes are shaped the way they are (post-PH-launch
   incident retrospective).
+- [`docs/adr/ADR-003-closed-loops-event-bus.md`](docs/adr/ADR-003-closed-loops-event-bus.md) —
+  in-process event bus pattern, subject conventions, what makes an
+  authorized auto-action.
 
 ## The constellation today
 

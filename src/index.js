@@ -43,7 +43,7 @@ const url = require("url");
 const crypto = require("crypto");
 const { EventEmitter } = require("events");
 
-// staffBus — per ADR-002, the in-process notification bus that lets
+// staffBus — per ADR-003, the in-process notification bus that lets
 // roles react to each other in real time without going through NATS.
 // Subjects use the same KANNAKA.staff.<verb>.<resource> namespace so
 // the wiring transposes cleanly if we ever extract roles to separate
@@ -52,7 +52,7 @@ const staffBus = new EventEmitter();
 staffBus.setMaxListeners(64);
 
 // busRing — ring buffer of the last N events for dashboard
-// observability (ADR-002 § Open Questions). Without this, closed
+// observability (ADR-003 § Open Questions). Without this, closed
 // loops fire silently and you can't tell whether a handler chose
 // not to act (cooldown, no starving albums, etc) — only that an
 // auto-action either fired or didn't. The ring buffer captures
@@ -216,7 +216,7 @@ function probeTcp(host, port, timeoutMs = 5000) {
   });
 }
 
-// ADR-002 Probe 1 — count kannaka-radio processes. The 2026-05-05 PH
+// ADR-003 Probe 1 — count kannaka-radio processes. The 2026-05-05 PH
 // launch incident had two competing radio nodes (PM2 + systemd); the
 // existing radio_service probe returned green because one was systemd-
 // managed. This probe asks the right question: how many.
@@ -242,7 +242,7 @@ function probeRadioSingleton() {
   });
 }
 
-// ADR-002 Probe 2 — radio_port_alive. systemd reports active when the
+// ADR-003 Probe 2 — radio_port_alive. systemd reports active when the
 // node process is alive even if the HTTP server died inside the node.
 // Composite check: service active AND TCP port bound. Catches the
 // silent HTTP-server death pattern that caused the SPA's recently-
@@ -260,7 +260,7 @@ async function probeRadioPortAlive() {
   return { ok: true, message: "service active + port 8888 bound" };
 }
 
-// ADR-002 Probe 3 — metadata mount alignment. icecast-metadata.js
+// ADR-003 Probe 3 — metadata mount alignment. icecast-metadata.js
 // defaults to /preview but the public SPA points listeners at /stream.
 // Without `export ICECAST_MOUNT=/stream` in run-radio.sh, listeners see
 // blank Now-Playing forever. Probe reads run-radio.sh directly (proc/
@@ -279,7 +279,7 @@ function probeMetadataMountAlignment() {
   });
 }
 
-// ADR-002 Probe 4 — stream_metadata_advancing. Polls icecast status-json
+// ADR-003 Probe 4 — stream_metadata_advancing. Polls icecast status-json
 // every tick. Tracks /stream title + last change time. Alert if listeners
 // >0 and title hasn't advanced in TRACK_STALL_MS. Catches dj-engine
 // stalls, source-disconnect-without-restart, and metadata-writer death.
@@ -316,7 +316,7 @@ async function probeStreamMetadataAdvancing() {
   };
 }
 
-// ADR-002 Probe 5 — podcast_files_playable. Walks the podcast dir and
+// ADR-003 Probe 5 — podcast_files_playable. Walks the podcast dir and
 // runs ffprobe on each .mp3, checking sample_rate=44100 and
 // bit_rate<=192000. Files outside the envelope crash the radio's
 // pipe-fed ffmpeg the instant they're played; the podcast scheduler
@@ -384,13 +384,13 @@ async function runAllProbes() {
     results.radio_service = { ok: r.ok, message: r.message, ts };
   }
 
-  // 1a. radio_singleton — flag duplicate radio processes (ADR-002 Probe 1, local-only)
+  // 1a. radio_singleton — flag duplicate radio processes (ADR-003 Probe 1, local-only)
   if (!EXTERNAL_MODE) {
     const r = await probeRadioSingleton();
     results.radio_singleton = { ok: r.ok, message: r.message, ts };
   }
 
-  // 1b. radio_port_alive — flag service-alive-but-port-silent (ADR-002 Probe 2, local-only)
+  // 1b. radio_port_alive — flag service-alive-but-port-silent (ADR-003 Probe 2, local-only)
   if (!EXTERNAL_MODE) {
     const r = await probeRadioPortAlive();
     results.radio_port_alive = { ok: r.ok, message: r.message, ts };
@@ -1317,7 +1317,7 @@ const server = http.createServer((req, res) => {
   // model: if STAFF_SHARED_SECRET is configured (production), require
   // an HMAC-SHA256 signature header. If not configured, allow same-
   // origin requests only (dashboard works locally; remote calls fail).
-  // ADR-002 Wave 3 — this is the oracle-admin shim QueenSync v2.0
+  // ADR-003 Wave 3 — this is the oracle-admin shim QueenSync v2.0
   // will dispatch tasks to from outside the Oracle network.
   if (req.method === "POST" && req.url.startsWith("/action/")) {
     const action = req.url.replace("/action/", "").split("?")[0];
@@ -1474,10 +1474,10 @@ try {
   console.warn(`[staff] storyteller boot failed: ${e.message}`);
 }
 
-// ── Closed loops (per ADR-002) ──────────────────────────────
+// ── Closed loops (per ADR-003) ──────────────────────────────
 // Authorized auto-actions live here, in one auditable block. Each
 // loop has a single trigger, a single action, and a rate limit.
-// New loops require a new entry in ADR-002.
+// New loops require a new entry in ADR-003.
 const AUTO_RECOVER = {
   // Stuck-stream auto-recover: when Ear has confirmed dead air, ask
   // Watcher's existing restart-radio action to bounce the service.

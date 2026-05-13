@@ -156,7 +156,7 @@ function bootEar(deps) {
       if (e.silentStreak >= cfg.confirmTicks && !e.silentAlerted) {
         logAlert("EAR_STREAM_SILENT", `${e.silentStreak} consecutive silent samples (variance=${stats.variance.toFixed(1)}) — dead air`);
         e.silentAlerted = true;
-        // Notify other staff roles (per ADR-002). Watcher subscribes
+        // Notify other staff roles (per ADR-003). Watcher subscribes
         // to this subject for the stuck-stream auto-recover loop.
         publish("KANNAKA.staff.stream.silent", {
           silentStreak: e.silentStreak,
