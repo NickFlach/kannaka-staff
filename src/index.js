@@ -854,6 +854,13 @@ async function handleAction(action, query) {
       if (!marketer) return { ok: false, error: "marketer not online" };
       return marketer.postMessage(query);
     }
+    case "curator-rescue": {
+      // Manual trigger of the auto-rescue loop (skips the
+      // KANNAKA.staff.album.starving publish path; still honors the
+      // 24h global cooldown — pass ?force=1 to override for one shot).
+      if (query.force === "1") AUTO_RESCUE.lastRescueTs = 0;
+      return fireRescue("manual operator trigger from dashboard");
+    }
     default:
       return { ok: false, error: `unknown action: ${action}` };
   }
@@ -949,6 +956,10 @@ curl -X POST "https://staff.ninja-portal.com/action/&#36;ACTION" \\
 <div class="alerts">
   <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">CURATOR — ALBUM STALENESS</h3>
   <div id="staleness"><div class="empty">loading…</div></div>
+  <div style="margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap;">
+    <button onclick="confirmAct('curator-rescue')" class="btn">🚒 rescue oldest-starving (cooldown 24h)</button>
+    <button onclick="confirmAct('curator-rescue', { force: '1' })" class="btn warn">🚒 force rescue (skip cooldown)</button>
+  </div>
 </div>
 <div class="alerts">
   <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">DISTRIBUTOR — RELEASE-ALBUM JOBS</h3>
@@ -1453,6 +1464,74 @@ if (!EXTERNAL_MODE) {
     });
   });
   console.log(`[staff] auto-recover online — stream.silent → restart-radio (cooldown ${Math.round(AUTO_RECOVER.cooldownMs / 60000)}m)`);
+}
+
+// Second closed loop — album rescue. When Curator flags an album as
+// starving, schedule a 20-min showcase via the radio's existing
+// /api/album/showcase action. The rate-limit is GLOBAL (not per
+// album) — five albums starving simultaneously would otherwise burn
+// 100+ minutes of overridden programming in a day. Picking the
+// oldest-aged starving album keeps the rescue pointed at the worst-
+// off entry. Manual override available via /action/curator-rescue.
+const AUTO_RESCUE = {
+  lastRescueTs: 0,
+  cooldownMs: parseInt(process.env.AUTO_RESCUE_COOLDOWN_MS || "", 10) || 24 * 60 * 60 * 1000,
+  durationMin: parseInt(process.env.AUTO_RESCUE_DURATION_MIN || "", 10) || 20,
+};
+async function fireRescue(reason) {
+  if (!curator) return { ok: false, error: "curator not online" };
+  const sinceLast = Date.now() - AUTO_RESCUE.lastRescueTs;
+  if (sinceLast < AUTO_RESCUE.cooldownMs) {
+    const hrs = Math.round((AUTO_RESCUE.cooldownMs - sinceLast) / 3600000);
+    return { ok: false, error: `cooldown active (${hrs}h remaining)` };
+  }
+  const starving = curator.starvingAlbums();
+  if (starving.length === 0) return { ok: false, error: "no starving albums to rescue" };
+  const target = starving[0];
+  AUTO_RESCUE.lastRescueTs = Date.now();
+  const u = `${RADIO_BASE}/api/album/showcase?album=${encodeURIComponent(target.album)}&duration=${AUTO_RESCUE.durationMin}`;
+  return new Promise((resolve) => {
+    const lib = url.parse(u).protocol === "https:" ? https : http;
+    const uu = url.parse(u);
+    const req = lib.request({
+      method: "POST",
+      hostname: uu.hostname,
+      port: uu.port || 80,
+      path: uu.pathname + (uu.search || ""),
+      timeout: 10_000,
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const ok = res.statusCode >= 200 && res.statusCode < 400;
+        const entry = {
+          ts: new Date().toISOString(),
+          probe: "auto-rescue",
+          transition: ok ? "AUTO_RESCUE_FIRED" : "AUTO_RESCUE_FAILED",
+          message: `"${target.album}" — ${Math.round((target.ageMs || 0) / 3600000)}h stale — showcase ${AUTO_RESCUE.durationMin}min (${reason}) — HTTP ${res.statusCode}`,
+        };
+        try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(entry) + "\n"); } catch (_) {}
+        console.log(`[auto-rescue] ${entry.transition}: ${entry.message}`);
+        resolve({ ok, album: target.album, durationMin: AUTO_RESCUE.durationMin, status: res.statusCode });
+      });
+    });
+    req.on("error", (e) => {
+      // roll back the rate-limit stamp on transport failure so the next
+      // tick can retry — we don't want a network blip to consume the
+      // 24h slot.
+      AUTO_RESCUE.lastRescueTs = sinceLast > 0 ? AUTO_RESCUE.lastRescueTs - AUTO_RESCUE.cooldownMs : 0;
+      resolve({ ok: false, error: e.message });
+    });
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.end();
+  });
+}
+if (!EXTERNAL_MODE) {
+  staffBus.on("KANNAKA.staff.album.starving", (ev) => {
+    fireRescue(`triggered by starving event for "${ev.payload.album}"`)
+      .then((r) => { if (!r.ok && r.error && !r.error.startsWith("cooldown")) console.log(`[auto-rescue] skipped: ${r.error}`); });
+  });
+  console.log(`[staff] auto-rescue online — album.starving → showcase ${AUTO_RESCUE.durationMin}m (cooldown ${Math.round(AUTO_RESCUE.cooldownMs / 3600000)}h)`);
 }
 
 server.listen(PORT, () => {

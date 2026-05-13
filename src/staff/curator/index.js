@@ -141,6 +141,12 @@ function bootCurator(deps) {
   const RADIO_BASE = deps.radioBase;
   const ALERTS_FILE = deps.alertsFile;
   const STATE_FILE = path.join(path.dirname(ALERTS_FILE), "curator-state.json");
+  const bus = deps.staffBus || null;
+
+  function publish(subject, payload) {
+    if (!bus) return;
+    bus.emit(subject, { ts: Date.now(), source: "curator", subject, payload });
+  }
 
   const cfg = {
     tickMs: readEnvMs("CURATOR_TICK_MS", DEFAULTS.TICK_MS),
@@ -226,10 +232,13 @@ function bootCurator(deps) {
         if (next === "starving") {
           const hrs = Math.round(album.ageMs / 3600000);
           logAlert("CURATOR_ALBUM_STARVING", `"${album.album}" — ${hrs}h since last play (plays in window: ${album.playsInWindow})`);
+          publish("KANNAKA.staff.album.starving", { album: album.album, ageMs: album.ageMs, playsInWindow: album.playsInWindow });
         } else if (next === "never" && prev !== "never") {
           logAlert("CURATOR_ALBUM_NEVER_PLAYED", `"${album.album}" registered but absent from last ${snap.historyLen} tracks — check that files exist`);
+          publish("KANNAKA.staff.album.never_played", { album: album.album, historyLen: snap.historyLen });
         } else if (prev === "starving" && next !== "starving") {
           logAlert("CURATOR_ALBUM_REFRESHED", `"${album.album}" back in rotation`);
+          publish("KANNAKA.staff.album.refreshed", { album: album.album });
         }
       }
       c.classification[album.album] = next;
@@ -263,6 +272,14 @@ function bootCurator(deps) {
       };
     },
     tick,
+    /** Albums currently classified as starving, oldest-aged first. */
+    starvingAlbums() {
+      const snap = c.lastSnapshot;
+      if (!snap || !snap.ok) return [];
+      return snap.albums
+        .filter((a) => c.classification[a.album] === "starving")
+        .sort((a, b) => (b.ageMs || 0) - (a.ageMs || 0));
+    },
   };
 }
 
