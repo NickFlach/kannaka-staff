@@ -901,6 +901,33 @@ h1 { font-family: Orbitron, sans-serif; font-size: 1.4rem; color: var(--vio); ma
   <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">CURATOR — ALBUM STALENESS</h3>
   <div id="staleness"><div class="empty">loading…</div></div>
 </div>
+<div class="alerts">
+  <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">DISTRIBUTOR — RELEASE-ALBUM JOBS</h3>
+  <div id="distributor"><div class="empty">loading…</div></div>
+</div>
+<div class="alerts">
+  <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">CREATOR — GENERATION QUEUE</h3>
+  <div id="creator"><div class="empty">loading…</div></div>
+  <div style="margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap;">
+    <button onclick="act('creator-request', { kind: 'oration' })" class="btn">🕊 generate oration</button>
+  </div>
+</div>
+<div class="alerts">
+  <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">MARKETER — RECENT POSTS</h3>
+  <div id="marketer"><div class="empty">loading…</div></div>
+</div>
+<div class="alerts">
+  <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">VOICE — TALK-SEGMENT LOCK</h3>
+  <div id="voice"><div class="empty">loading…</div></div>
+</div>
+<div class="alerts">
+  <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">EAR — STREAM SILENCE</h3>
+  <div id="ear"><div class="empty">loading…</div></div>
+</div>
+<div class="alerts">
+  <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">STORYTELLER — SHOWCASE LANDSCAPE</h3>
+  <div id="storyteller"><div class="empty">loading…</div></div>
+</div>
 <script>
 function fmtAge(ms) {
   if (ms < 60_000) return Math.round(ms/1000) + 's';
@@ -963,6 +990,78 @@ async function refresh() {
         gv.innerHTML = '<div class="empty">' + (gr.error || 'growth offline') + '</div>';
       }
     } catch (_) {}
+    // Crew panels — each role exposes /api/<role>.
+    // Try/catch per panel so a single failed role doesn't blank the dashboard.
+    async function fillPanel(elId, url, render) {
+      try {
+        const j = await fetch(url).then(r => r.json());
+        document.getElementById(elId).innerHTML = render(j);
+      } catch (e) {
+        document.getElementById(elId).innerHTML = '<div class="empty">' + e.message + '</div>';
+      }
+    }
+    function ageHtml(ms) {
+      if (ms == null) return '<span style="color: var(--dim)">never</span>';
+      return fmtAge(ms) + ' ago';
+    }
+    await Promise.all([
+      fillPanel('distributor', '/api/distributor', (d) => {
+        if (!d.ok) return '<div class="empty">' + (d.error || 'offline') + '</div>';
+        const cur = d.current
+          ? '<div class="alert" style="border-left-color: var(--vio); background: rgba(167,139,250,0.06);"><strong>⏳ in flight:</strong> ' + d.current.name + ' (' + fmtAge(d.current.elapsedMs) + ' so far · skip=' + (d.current.skip || '-') + ')</div>'
+          : '<div class="alert" style="border-left-color: var(--dim); background: transparent;"><strong>idle</strong> — POST /action/distributor-publish?config=PATH to start</div>';
+        const hist = (d.history || []).slice(0, 5).map(h =>
+          '<div class="alert ' + (h.ok ? 'RECOVERED' : '') + '" style="border-left-color: ' + (h.ok ? 'var(--ok)' : 'var(--fail)') + ';"><span class="when">' + new Date(h.finishedAt).toLocaleTimeString() + '</span><strong>' + h.name + '</strong> · ' + (h.message || '').replace(/</g,'&lt;') + '</div>'
+        ).join('');
+        return cur + (hist || '<div class="empty">no jobs yet</div>');
+      }),
+      fillPanel('creator', '/api/creator', (d) => {
+        if (!d.ok) return '<div class="empty">' + (d.error || 'offline') + '</div>';
+        const cur = d.current
+          ? '<div class="alert" style="border-left-color: var(--vio); background: rgba(167,139,250,0.06);"><strong>⏳ ' + d.current.kind + ':</strong> ' + d.current.id + ' (' + fmtAge(d.current.elapsedMs) + ')</div>'
+          : '<div class="alert" style="border-left-color: var(--dim); background: transparent;"><strong>idle</strong></div>';
+        const hist = (d.history || []).slice(0, 5).map(h =>
+          '<div class="alert ' + (h.ok ? 'RECOVERED' : '') + '" style="border-left-color: ' + (h.ok ? 'var(--ok)' : 'var(--fail)') + ';"><span class="when">' + new Date(h.finishedAt).toLocaleTimeString() + '</span><strong>' + h.kind + '</strong> · ' + (h.message || '').replace(/</g,'&lt;').slice(0, 240) + '</div>'
+        ).join('');
+        return cur + (hist || '<div class="empty">no requests yet</div>');
+      }),
+      fillPanel('marketer', '/api/marketer', (d) => {
+        if (!d.ok) return '<div class="empty">' + (d.error || 'offline') + '</div>';
+        const hist = (d.history || []).slice(0, 5).map(h =>
+          '<div class="alert ' + (h.ok ? 'RECOVERED' : '') + '" style="border-left-color: ' + (h.ok ? 'var(--ok)' : 'var(--fail)') + ';"><span class="when">' + new Date(h.finishedAt).toLocaleTimeString() + '</span>' + (h.summary || '').replace(/</g,'&lt;') + '<br><span style="color: var(--dim); font-size: 0.75rem;">' + (h.text || '').replace(/</g,'&lt;').slice(0, 160) + '</span></div>'
+        ).join('');
+        return hist || '<div class="empty">no posts yet</div>';
+      }),
+      fillPanel('voice', '/api/voice', (d) => {
+        if (!d.ok) return '<div class="empty">' + (d.error || 'offline') + '</div>';
+        const s = d.snapshot;
+        if (!s) return '<div class="empty">no observations yet</div>';
+        const lockColor = s.lockHeld ? (d.lockStuckAlerted ? 'var(--fail)' : '#fbbf24') : 'var(--ok)';
+        return '<div class="alert" style="border-left-color: ' + lockColor + ';"><strong>lock:</strong> ' + (s.lockHeld ? 'HELD for ' + fmtAge(d.lockHeldForMs || 0) : 'free') + (s.currentSpeaker ? ' · speaker: ' + s.currentSpeaker : '') + (s.voiceQueue != null ? ' · queue: ' + s.voiceQueue : '') + '</div>';
+      }),
+      fillPanel('ear', '/api/ear', (d) => {
+        if (!d.ok) return '<div class="empty">' + (d.error || 'offline') + '</div>';
+        const s = d.lastStats;
+        if (!s) return '<div class="empty">no samples yet</div>';
+        if (!s.ok) return '<div class="alert" style="border-left-color: var(--fail);"><strong>sample failed:</strong> ' + (s.error || '?') + '</div>';
+        const color = d.silentAlerted ? 'var(--fail)' : (d.silentStreak > 0 ? '#fbbf24' : 'var(--ok)');
+        return '<div class="alert" style="border-left-color: ' + color + ';"><strong>variance:</strong> ' + s.variance.toFixed(1) + ' · mean: ' + s.mean.toFixed(1) + ' · ' + s.bytes + 'B sampled' + (d.silentStreak ? ' · silent streak: ' + d.silentStreak : '') + '</div>';
+      }),
+      fillPanel('storyteller', '/api/storyteller', (d) => {
+        if (!d.ok) return '<div class="empty">' + (d.error || 'offline') + '</div>';
+        const s = d.snapshot;
+        if (!s || !s.ok) return '<div class="empty">' + ((s && s.error) || 'no snapshot yet') + '</div>';
+        const ov = s.override
+          ? '<div class="alert" style="border-left-color: var(--vio); background: rgba(167,139,250,0.06);"><strong>override active:</strong> ' + s.override.album + (s.override.untilHuman ? ' (until ' + s.override.untilHuman + ')' : '') + '</div>'
+          : '';
+        const next = s.nextShowcase && s.nextShowcase.inMinutes != null
+          ? '<div class="alert" style="border-left-color: var(--ok);"><strong>next showcase:</strong> in ' + Math.floor(s.nextShowcase.inMinutes / 60) + 'h ' + (s.nextShowcase.inMinutes % 60) + 'm (' + s.nextShowcase.fixedSchedule + ')</div>'
+          : '';
+        const cur = '<div class="alert" style="border-left-color: var(--dim); background: transparent;"><strong>now:</strong> ' + (s.currentAlbum || '?') + (s.block ? ' · block: ' + s.block : '') + '</div>';
+        return cur + ov + next;
+      }),
+    ]);
+
     // Curator panel — pull classification summary from /api/curator
     // (the Curator role) and the per-album list from /api/album-staleness
     // (the watcher's read-only helper that pre-existed the role).
