@@ -51,6 +51,38 @@ const { EventEmitter } = require("events");
 const staffBus = new EventEmitter();
 staffBus.setMaxListeners(64);
 
+// busRing — ring buffer of the last N events for dashboard
+// observability (ADR-002 § Open Questions). Without this, closed
+// loops fire silently and you can't tell whether a handler chose
+// not to act (cooldown, no starving albums, etc) — only that an
+// auto-action either fired or didn't. The ring buffer captures
+// every publication so the operator can see the predicate evaluation.
+const BUS_RING_MAX = 100;
+const busRing = [];
+// Intercept emits on the bus by wrapping emit. The original emit
+// is preserved for handlers to receive normally.
+const _busEmit = staffBus.emit.bind(staffBus);
+staffBus.emit = function (subject, event) {
+  // Only ring our own KANNAKA.* subjects — EventEmitter has internal
+  // events (newListener, removeListener, error) we shouldn't log.
+  if (typeof subject === "string" && subject.startsWith("KANNAKA.")) {
+    busRing.push({
+      ts: (event && event.ts) || Date.now(),
+      source: (event && event.source) || "?",
+      subject,
+      // Stringify payload defensively — small payloads only.
+      summary: (() => {
+        try {
+          const s = JSON.stringify((event && event.payload) || {});
+          return s.length > 200 ? s.slice(0, 200) + "…" : s;
+        } catch { return "(unserializable)"; }
+      })(),
+    });
+    if (busRing.length > BUS_RING_MAX) busRing.shift();
+  }
+  return _busEmit(subject, event);
+};
+
 const { bootGrowth } = require("./staff/growth");
 const { bootCurator } = require("./staff/curator");
 const { bootDistributor } = require("./staff/distributor");
@@ -988,6 +1020,10 @@ curl -X POST "https://staff.ninja-portal.com/action/&#36;ACTION" \\
   <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">STORYTELLER — SHOWCASE LANDSCAPE</h3>
   <div id="storyteller"><div class="empty">loading…</div></div>
 </div>
+<div class="alerts">
+  <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">BUS — RECENT EVENTS (last 100)</h3>
+  <div id="bus"><div class="empty">loading…</div></div>
+</div>
 <script>
 function fmtAge(ms) {
   if (ms < 60_000) return Math.round(ms/1000) + 's';
@@ -1119,6 +1155,16 @@ async function refresh() {
           : '';
         const cur = '<div class="alert" style="border-left-color: var(--dim); background: transparent;"><strong>now:</strong> ' + (s.currentAlbum || '?') + (s.block ? ' · block: ' + s.block : '') + '</div>';
         return cur + ov + next;
+      }),
+      fillPanel('bus', '/api/bus', (d) => {
+        if (!d.ok || !d.events || d.events.length === 0) return '<div class="empty">no events yet — bus is quiet</div>';
+        return d.events.slice(0, 25).map(ev =>
+          '<div class="alert" style="border-left-color: var(--vio); background: rgba(167,139,250,0.04); font-size: 0.78rem;">'
+          + '<span class="when">' + new Date(ev.ts).toLocaleTimeString() + '</span>'
+          + '<strong>' + ev.source + '</strong> · ' + ev.subject.replace(/</g,'&lt;')
+          + '<br><span style="color: var(--dim); font-family: Consolas, monospace;">' + (ev.summary || '').replace(/</g,'&lt;') + '</span>'
+          + '</div>'
+        ).join('');
       }),
     ]);
 
@@ -1259,6 +1305,11 @@ const server = http.createServer((req, res) => {
   if (req.url === "/api/storyteller") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(storyteller ? { ok: true, ...storyteller.getState() } : { ok: false, error: "storyteller not online" }));
+    return;
+  }
+  if (req.url.startsWith("/api/bus")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, count: busRing.length, events: busRing.slice().reverse() }));
     return;
   }
   // ── Operations console: write actions ───────────────────────
