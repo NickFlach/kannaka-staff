@@ -66,6 +66,12 @@ function bootVoice(deps) {
   const RADIO_BASE = deps.radioBase;
   const ALERTS_FILE = deps.alertsFile;
   const STATE_FILE = path.join(path.dirname(ALERTS_FILE), "voice-state.json");
+  const bus = deps.staffBus || null;
+
+  function publish(subject, payload) {
+    if (!bus) return;
+    bus.emit(subject, { ts: Date.now(), source: "voice", subject, payload });
+  }
 
   const cfg = {
     tickMs: readEnvMs("VOICE_TICK_MS", DEFAULTS.TICK_MS),
@@ -120,11 +126,17 @@ function bootVoice(deps) {
       if (heldFor > cfg.stuckMs && !v.lockStuckAlerted) {
         logAlert("VOICE_LOCK_STUCK", `talk-segment lock held ${Math.round(heldFor / 60000)} min — investigate`);
         v.lockStuckAlerted = true;
+        publish("KANNAKA.staff.voice.lock.stuck", {
+          heldForMs: heldFor,
+          currentSpeaker: v.snapshot && v.snapshot.currentSpeaker,
+          voiceQueue: v.snapshot && v.snapshot.voiceQueue,
+        });
       }
     } else {
       if (v.lockStuckAlerted) {
         const heldFor = v.lockObservedAt ? (Date.now() - v.lockObservedAt) : 0;
         logAlert("VOICE_LOCK_RECOVERED", `lock cleared after ${Math.round(heldFor / 60000)} min`);
+        publish("KANNAKA.staff.voice.lock.recovered", { heldForMs: heldFor });
       }
       v.lockObservedAt = null;
       v.lockStuckAlerted = false;

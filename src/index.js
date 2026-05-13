@@ -1486,35 +1486,46 @@ const AUTO_RECOVER = {
   lastRestartTs: 0,
   cooldownMs: parseInt(process.env.AUTO_RECOVER_COOLDOWN_MS || "", 10) || 30 * 60 * 1000,
 };
-if (!EXTERNAL_MODE) {
-  staffBus.on("KANNAKA.staff.stream.silent", (ev) => {
-    const sinceLast = Date.now() - AUTO_RECOVER.lastRestartTs;
-    if (sinceLast < AUTO_RECOVER.cooldownMs) {
-      const mins = Math.round((AUTO_RECOVER.cooldownMs - sinceLast) / 60000);
-      console.log(`[auto-recover] stream.silent received but cooldown active (${mins}m remaining)`);
-      return;
-    }
-    AUTO_RECOVER.lastRestartTs = Date.now();
-    const entry = {
+function runAutoRecoverRestart(reason) {
+  const sinceLast = Date.now() - AUTO_RECOVER.lastRestartTs;
+  if (sinceLast < AUTO_RECOVER.cooldownMs) {
+    const mins = Math.round((AUTO_RECOVER.cooldownMs - sinceLast) / 60000);
+    console.log(`[auto-recover] ${reason} — cooldown active (${mins}m remaining)`);
+    return;
+  }
+  AUTO_RECOVER.lastRestartTs = Date.now();
+  const entry = {
+    ts: new Date().toISOString(),
+    probe: "auto-recover",
+    transition: "AUTO_RECOVER_RESTART",
+    message: `${reason} — restarting kannaka-radio`,
+  };
+  try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(entry) + "\n"); } catch (_) {}
+  console.log(`[auto-recover] AUTO_RECOVER_RESTART: ${entry.message}`);
+  execFile("sudo", ["/bin/systemctl", "restart", "kannaka-radio"], { timeout: 30_000 }, (err, _out, errOut) => {
+    const done = {
       ts: new Date().toISOString(),
       probe: "auto-recover",
-      transition: "AUTO_RECOVER_RESTART",
-      message: `stream silent (variance=${ev.payload.variance.toFixed(1)}, streak=${ev.payload.silentStreak}) — restarting kannaka-radio`,
+      transition: err ? "AUTO_RECOVER_FAILED" : "AUTO_RECOVER_DONE",
+      message: err ? `restart failed: ${err.message} ${(errOut || "").slice(0, 200)}` : "kannaka-radio restart completed",
     };
-    try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(entry) + "\n"); } catch (_) {}
-    console.log(`[auto-recover] AUTO_RECOVER_RESTART: ${entry.message}`);
-    execFile("sudo", ["/bin/systemctl", "restart", "kannaka-radio"], { timeout: 30_000 }, (err, _out, errOut) => {
-      const done = {
-        ts: new Date().toISOString(),
-        probe: "auto-recover",
-        transition: err ? "AUTO_RECOVER_FAILED" : "AUTO_RECOVER_DONE",
-        message: err ? `restart failed: ${err.message} ${(errOut || "").slice(0, 200)}` : "kannaka-radio restart completed",
-      };
-      try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(done) + "\n"); } catch (_) {}
-      console.log(`[auto-recover] ${done.transition}: ${done.message}`);
-    });
+    try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(done) + "\n"); } catch (_) {}
+    console.log(`[auto-recover] ${done.transition}: ${done.message}`);
   });
-  console.log(`[staff] auto-recover online — stream.silent → restart-radio (cooldown ${Math.round(AUTO_RECOVER.cooldownMs / 60000)}m)`);
+}
+if (!EXTERNAL_MODE) {
+  // Stream-silent trigger: Ear saw dead air → restart.
+  staffBus.on("KANNAKA.staff.stream.silent", (ev) => {
+    runAutoRecoverRestart(`stream silent (variance=${ev.payload.variance.toFixed(1)}, streak=${ev.payload.silentStreak})`);
+  });
+  // Voice-lock-stuck trigger: TTS queue jammed → restart fixes it.
+  // Shares the SAME cooldown bucket as stream.silent because both
+  // failures usually want the same remedy and we don't want a stuck
+  // lock + dead air co-occurring to cause a double-restart.
+  staffBus.on("KANNAKA.staff.voice.lock.stuck", (ev) => {
+    runAutoRecoverRestart(`talk-segment lock stuck for ${Math.round(ev.payload.heldForMs / 60000)}m`);
+  });
+  console.log(`[staff] auto-recover online — stream.silent + voice.lock.stuck → restart-radio (shared cooldown ${Math.round(AUTO_RECOVER.cooldownMs / 60000)}m)`);
 }
 
 // Second closed loop — album rescue. When Curator flags an album as
