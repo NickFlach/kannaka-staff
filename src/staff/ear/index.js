@@ -96,6 +96,12 @@ function bootEar(deps) {
   const STREAM_URL = deps.streamUrl;
   const ALERTS_FILE = deps.alertsFile;
   const STATE_FILE = path.join(path.dirname(ALERTS_FILE), "ear-state.json");
+  const bus = deps.staffBus || null;
+
+  function publish(subject, payload) {
+    if (!bus) return;
+    bus.emit(subject, { ts: Date.now(), source: "ear", subject, payload });
+  }
 
   const cfg = {
     tickMs: readEnvMs("EAR_TICK_MS", DEFAULTS.TICK_MS),
@@ -150,10 +156,19 @@ function bootEar(deps) {
       if (e.silentStreak >= cfg.confirmTicks && !e.silentAlerted) {
         logAlert("EAR_STREAM_SILENT", `${e.silentStreak} consecutive silent samples (variance=${stats.variance.toFixed(1)}) — dead air`);
         e.silentAlerted = true;
+        // Notify other staff roles (per ADR-002). Watcher subscribes
+        // to this subject for the stuck-stream auto-recover loop.
+        publish("KANNAKA.staff.stream.silent", {
+          silentStreak: e.silentStreak,
+          variance: stats.variance,
+          mean: stats.mean,
+          sampleBytes: r.buf.length,
+        });
       }
     } else {
       if (e.silentAlerted) {
         logAlert("EAR_STREAM_RECOVERED", `audio back (variance=${stats.variance.toFixed(1)})`);
+        publish("KANNAKA.staff.stream.recovered", { variance: stats.variance });
       }
       e.silentStreak = 0;
       e.silentAlerted = false;

@@ -41,6 +41,15 @@ const { exec, execFile } = require("child_process");
 const net = require("net");
 const url = require("url");
 const crypto = require("crypto");
+const { EventEmitter } = require("events");
+
+// staffBus — per ADR-002, the in-process notification bus that lets
+// roles react to each other in real time without going through NATS.
+// Subjects use the same KANNAKA.staff.<verb>.<resource> namespace so
+// the wiring transposes cleanly if we ever extract roles to separate
+// processes. Every event has shape {ts, source, subject, payload}.
+const staffBus = new EventEmitter();
+staffBus.setMaxListeners(64);
 
 const { bootGrowth } = require("./staff/growth");
 const { bootCurator } = require("./staff/curator");
@@ -478,6 +487,34 @@ async function runAllProbes() {
     results.swarm_serve_service = { ok: r.ok, message: r.message, ts };
   }
 
+  // 7b. listener_count — track active stream listeners. Alert when
+  // the count drops to 0 for an extended window while the stream is
+  // supposedly serving (icecast still 200, dj-engine still advancing).
+  // That pattern usually means the audio sink got disconnected and
+  // listeners can't actually hear anything even though every other
+  // probe is green. We accept counts of 0 as "ok" because nighttime
+  // dips are normal; the alert is the persistence of zero across the
+  // hysteresis window, same as other probes.
+  {
+    const r = await probeHttp(`${RADIO_BASE}/api/state`, { timeout: 5000, maxBody: 8 * 1024 });
+    if (r.ok) {
+      let count = null;
+      try {
+        const s = JSON.parse(r.body);
+        const v = s.listeners ?? s.listenerCount ?? s.listener_count;
+        if (typeof v === "number") count = v;
+        else if (v && typeof v === "object" && typeof v.total === "number") count = v.total;
+      } catch (_) { /* leave count null on parse failure */ }
+      results.listener_count = {
+        ok: count == null ? false : count > 0,
+        message: count == null ? "listener field absent" : `${count} active`,
+        ts,
+      };
+    } else {
+      results.listener_count = { ok: false, message: `HTTP ${r.status} ${r.error || ""}`, ts };
+    }
+  }
+
   // 8. hrm_size — alert if >HRM_SIZE_ALERT_MB (local-only file stat)
   if (!EXTERNAL_MODE) {
     try {
@@ -884,6 +921,18 @@ h1 { font-family: Orbitron, sans-serif; font-size: 1.4rem; color: var(--vio); ma
   <button onclick="confirmAct('restart-observatory')" class="btn warn">↻ restart observatory</button>
 </div>
 <div id="actionResult" style="font-size: 0.78rem; color: var(--dim); min-height: 16px; margin-bottom: 12px;"></div>
+<details style="font-size: 0.75rem; color: var(--dim); margin-bottom: 16px;">
+  <summary style="cursor: pointer;">remote curl (HMAC signature)</summary>
+  <pre style="background: rgba(255,255,255,0.03); padding: 10px; border-radius: 4px; overflow-x: auto; margin-top: 6px;">SECRET=...                      # set via STAFF_SHARED_SECRET on the staff host
+TS=&#36;(date +%s%3N)
+ACTION="growth-dream?mode=lite"
+SIG=&#36;(printf "%s\\n%s\\n/action/%s" "&#36;TS" "POST" "&#36;ACTION" | openssl dgst -sha256 -hmac "&#36;SECRET" | awk '{print &#36;2}')
+curl -X POST "https://staff.ninja-portal.com/action/&#36;ACTION" \\
+  -u "nick:&lt;basic-auth-pass&gt;" \\
+  -H "X-Staff-Timestamp: &#36;TS" \\
+  -H "X-Staff-Signature: &#36;SIG"</pre>
+  <div style="margin-top: 4px;">basic-auth is nginx-layer; HMAC is required for non-localhost callers when STAFF_SHARED_SECRET is set. Within 5-min skew, sha256(<code>&#36;{TS}\\n&#36;{METHOD}\\n&#36;{PATH}</code>) signed with the secret.</div>
+</details>
 <div class="grid" id="probes"></div>
 <div class="alerts">
   <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">RECENT ALERTS</h3>
@@ -1270,7 +1319,7 @@ const server = http.createServer((req, res) => {
 let growth = null;
 if (!EXTERNAL_MODE) {
   try {
-    growth = bootGrowth({ hrmPath: HRM_PATH, alertsFile: ALERTS_FILE });
+    growth = bootGrowth({ hrmPath: HRM_PATH, alertsFile: ALERTS_FILE, staffBus });
     console.log(`[staff] growth online — tick ${Math.round(growth.getState().cfg.tickMs / 60000)}m · HRM thresholds ${growth.getState().cfg.hrmSoftMB}/${growth.getState().cfg.hrmHardMB} MB`);
   } catch (e) {
     console.warn(`[staff] growth boot failed: ${e.message}`);
@@ -1283,7 +1332,7 @@ if (!EXTERNAL_MODE) {
 // Safe in EXTERNAL_MODE — only needs HTTP access to the radio.
 let curator = null;
 try {
-  curator = bootCurator({ radioBase: RADIO_BASE, alertsFile: ALERTS_FILE });
+  curator = bootCurator({ radioBase: RADIO_BASE, alertsFile: ALERTS_FILE, staffBus });
   const cs = curator.getState();
   console.log(`[staff] curator online — tick ${Math.round(cs.cfg.tickMs / 60000)}m · starving ≥ ${Math.round(cs.cfg.starvingMs / 3600000)}h`);
 } catch (e) {
@@ -1297,7 +1346,7 @@ try {
 let distributor = null;
 if (!EXTERNAL_MODE) {
   try {
-    distributor = bootDistributor({ alertsFile: ALERTS_FILE });
+    distributor = bootDistributor({ alertsFile: ALERTS_FILE, staffBus });
     const ds = distributor.getState();
     const scriptOk = require("fs").existsSync(ds.cfg.releaseScript);
     console.log(`[staff] distributor online — release script ${scriptOk ? "ok" : "MISSING"} at ${ds.cfg.releaseScript} · timeout ${Math.round(ds.cfg.jobTimeoutMs / 60000)}m`);
@@ -1311,7 +1360,7 @@ if (!EXTERNAL_MODE) {
 // ── Boot Creator (generation dispatcher) ────────────────────
 let creator = null;
 try {
-  creator = bootCreator({ radioBase: RADIO_BASE, alertsFile: ALERTS_FILE });
+  creator = bootCreator({ radioBase: RADIO_BASE, alertsFile: ALERTS_FILE, staffBus });
   console.log(`[staff] creator online — kinds: oration, image (track via Distributor)`);
 } catch (e) {
   console.warn(`[staff] creator boot failed: ${e.message}`);
@@ -1322,7 +1371,7 @@ try {
 let marketer = null;
 if (!EXTERNAL_MODE) {
   try {
-    marketer = bootMarketer({ alertsFile: ALERTS_FILE });
+    marketer = bootMarketer({ alertsFile: ALERTS_FILE, staffBus });
     const ms = marketer.getState();
     const radioOk = require("fs").existsSync(require("path").join(ms.cfg.radioRepo, "server/broadcasters"));
     console.log(`[staff] marketer online — broadcasters ${radioOk ? "ok" : "MISSING"} at ${ms.cfg.radioRepo}/server/broadcasters`);
@@ -1336,7 +1385,7 @@ if (!EXTERNAL_MODE) {
 // ── Boot Voice (talk-segment lock observer) ─────────────────
 let voice = null;
 try {
-  voice = bootVoice({ radioBase: RADIO_BASE, alertsFile: ALERTS_FILE });
+  voice = bootVoice({ radioBase: RADIO_BASE, alertsFile: ALERTS_FILE, staffBus });
   const vs = voice.getState();
   console.log(`[staff] voice online — tick ${Math.round(vs.cfg.tickMs / 60000)}m · stuck threshold ${Math.round(vs.cfg.stuckMs / 60000)}m`);
 } catch (e) {
@@ -1346,7 +1395,7 @@ try {
 // ── Boot Ear (stream silence detector) ──────────────────────
 let ear = null;
 try {
-  ear = bootEar({ streamUrl: STREAM_URL, alertsFile: ALERTS_FILE });
+  ear = bootEar({ streamUrl: STREAM_URL, alertsFile: ALERTS_FILE, staffBus });
   const es = ear.getState();
   console.log(`[staff] ear online — tick ${Math.round(es.cfg.tickMs / 60000)}m · sample ${es.cfg.sampleBytes}B · confirm ${es.cfg.confirmTicks}t`);
 } catch (e) {
@@ -1356,11 +1405,54 @@ try {
 // ── Boot Storyteller (showcase landscape observer) ──────────
 let storyteller = null;
 try {
-  storyteller = bootStoryteller({ radioBase: RADIO_BASE, alertsFile: ALERTS_FILE });
+  storyteller = bootStoryteller({ radioBase: RADIO_BASE, alertsFile: ALERTS_FILE, staffBus });
   const ss = storyteller.getState();
   console.log(`[staff] storyteller online — tick ${Math.round(ss.cfg.tickMs / 60000)}m`);
 } catch (e) {
   console.warn(`[staff] storyteller boot failed: ${e.message}`);
+}
+
+// ── Closed loops (per ADR-002) ──────────────────────────────
+// Authorized auto-actions live here, in one auditable block. Each
+// loop has a single trigger, a single action, and a rate limit.
+// New loops require a new entry in ADR-002.
+const AUTO_RECOVER = {
+  // Stuck-stream auto-recover: when Ear has confirmed dead air, ask
+  // Watcher's existing restart-radio action to bounce the service.
+  // Cooldown prevents a flap loop if the radio comes back silent
+  // immediately after a restart.
+  lastRestartTs: 0,
+  cooldownMs: parseInt(process.env.AUTO_RECOVER_COOLDOWN_MS || "", 10) || 30 * 60 * 1000,
+};
+if (!EXTERNAL_MODE) {
+  staffBus.on("KANNAKA.staff.stream.silent", (ev) => {
+    const sinceLast = Date.now() - AUTO_RECOVER.lastRestartTs;
+    if (sinceLast < AUTO_RECOVER.cooldownMs) {
+      const mins = Math.round((AUTO_RECOVER.cooldownMs - sinceLast) / 60000);
+      console.log(`[auto-recover] stream.silent received but cooldown active (${mins}m remaining)`);
+      return;
+    }
+    AUTO_RECOVER.lastRestartTs = Date.now();
+    const entry = {
+      ts: new Date().toISOString(),
+      probe: "auto-recover",
+      transition: "AUTO_RECOVER_RESTART",
+      message: `stream silent (variance=${ev.payload.variance.toFixed(1)}, streak=${ev.payload.silentStreak}) — restarting kannaka-radio`,
+    };
+    try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(entry) + "\n"); } catch (_) {}
+    console.log(`[auto-recover] AUTO_RECOVER_RESTART: ${entry.message}`);
+    execFile("sudo", ["/bin/systemctl", "restart", "kannaka-radio"], { timeout: 30_000 }, (err, _out, errOut) => {
+      const done = {
+        ts: new Date().toISOString(),
+        probe: "auto-recover",
+        transition: err ? "AUTO_RECOVER_FAILED" : "AUTO_RECOVER_DONE",
+        message: err ? `restart failed: ${err.message} ${(errOut || "").slice(0, 200)}` : "kannaka-radio restart completed",
+      };
+      try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(done) + "\n"); } catch (_) {}
+      console.log(`[auto-recover] ${done.transition}: ${done.message}`);
+    });
+  });
+  console.log(`[staff] auto-recover online — stream.silent → restart-radio (cooldown ${Math.round(AUTO_RECOVER.cooldownMs / 60000)}m)`);
 }
 
 server.listen(PORT, () => {
