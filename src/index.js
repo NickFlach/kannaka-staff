@@ -327,7 +327,13 @@ let _lastPodcastProbeAt = 0;
 let _lastPodcastResult = { ok: true, message: "not yet probed" };
 async function probePodcastFilesPlayable() {
   const now = Date.now();
-  if (now - _lastPodcastProbeAt < 60 * 60 * 1000) return _lastPodcastResult;
+  // Asymmetric cooldown: 1h when healthy (ffprobe is cheap but not free,
+  // and once we've green-lit the dir nothing changes file-by-file), but
+  // only 5 min when failing — Nick fixed the bad files 2026-05-14 and
+  // the dashboard kept saying broken for nearly an hour because the
+  // healthy-state cache window was applied to the failed state too.
+  const cooldown = _lastPodcastResult.ok ? 60 * 60 * 1000 : 5 * 60 * 1000;
+  if (now - _lastPodcastProbeAt < cooldown) return _lastPodcastResult;
   _lastPodcastProbeAt = now;
   const fs = require("fs");
   const path = require("path");
@@ -1199,8 +1205,14 @@ async function refresh() {
         stale.innerHTML = header + '<div class="empty">' + (cur.message || 'no staleness data') + '</div>';
       }
     } catch (_) {}
+    // Pull active listeners out of the listener_count probe message
+    // ("N active" or "listener field absent"). Surfaced in the header
+    // so the operator sees it without scrolling.
+    const lcProbe = probes.listener_count;
+    const listenerMatch = lcProbe && lcProbe.message && lcProbe.message.match(/^(\d+) active/);
+    const listenerStr = listenerMatch ? listenerMatch[1] + ' listening' : '— listening';
     document.getElementById('meta').textContent =
-      'tick: ' + (s.lastTick ? new Date(s.lastTick).toLocaleTimeString() : '?') + ' · probes: ' + Object.keys(probes).length + ' · alerts logged: ' + a.length;
+      listenerStr + ' · tick: ' + (s.lastTick ? new Date(s.lastTick).toLocaleTimeString() : '?') + ' · probes: ' + Object.keys(probes).length + ' · alerts logged: ' + a.length;
   } catch (e) {
     document.getElementById('meta').textContent = 'error: ' + e.message;
   }
