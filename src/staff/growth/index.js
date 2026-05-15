@@ -48,8 +48,21 @@ const path = require("path");
 
 const DEFAULTS = {
   TICK_MS: 15 * 60 * 1000,            // 15 min
+  // Size-based thresholds are tuned for the primary HRM (37 MB typical,
+  // 70 MB worrying, 95 MB critical). Hosts whose HRM is small but
+  // memory-count grows fast (e.g. the witness, which accumulates audio:
+  // perception ticks) should override these via env vars to lower
+  // values OR rely on the count-based thresholds below instead.
   HRM_SOFT_MB: 70,
   HRM_HARD_MB: 95,
+  // Count-based thresholds — added 2026-05-14 after the witness HRM
+  // blew up to 7753 entries while staying small in bytes. A host
+  // exceeding the count threshold fires the same lite dream as for
+  // size — the dream pass + downstream prune-cron drives the count
+  // back down. Defaults are generous for the primary HRM; the
+  // witness should env-override to ~150 / ~300.
+  MEMORY_SOFT: 1200,
+  MEMORY_HARD: 2000,
   NORMAL_INTERVAL_MS: 12 * 60 * 60 * 1000,  // 12h
   SOFT_MIN_GAP_MS: 6 * 60 * 60 * 1000,      // 6h
   DREAM_TIMEOUT_MS: 12 * 60 * 1000,         // 12 min — slightly more than
@@ -85,6 +98,8 @@ function bootGrowth(deps) {
     tickMs: readEnvMs("GROWTH_TICK_MS", DEFAULTS.TICK_MS),
     hrmSoftMB: readEnvMB("GROWTH_HRM_SOFT_MB", DEFAULTS.HRM_SOFT_MB),
     hrmHardMB: readEnvMB("GROWTH_HRM_HARD_MB", DEFAULTS.HRM_HARD_MB),
+    memorySoft: parseInt(process.env.GROWTH_MEMORY_SOFT || "", 10) || DEFAULTS.MEMORY_SOFT,
+    memoryHard: parseInt(process.env.GROWTH_MEMORY_HARD || "", 10) || DEFAULTS.MEMORY_HARD,
     normalIntervalMs: readEnvMs("GROWTH_NORMAL_INTERVAL_MS", DEFAULTS.NORMAL_INTERVAL_MS),
     softMinGapMs: readEnvMs("GROWTH_SOFT_MIN_GAP_MS", DEFAULTS.SOFT_MIN_GAP_MS),
     dreamTimeoutMs: readEnvMs("GROWTH_DREAM_TIMEOUT_MS", DEFAULTS.DREAM_TIMEOUT_MS),
@@ -213,12 +228,22 @@ function bootGrowth(deps) {
     const sample = sampleHrm();
     if (sample.sizeMB == null) return { action: "skip", reason: "HRM not readable on this host" };
 
-    // Edge-trigger bloat alert (one-shot per bloat episode).
-    if (sample.sizeMB >= cfg.hrmHardMB && !g.bloatedAlerted) {
-      logAlert("GROWTH_HRM_BLOATED", `HRM=${sample.sizeMB.toFixed(1)} MB >= ${cfg.hrmHardMB} MB — kicking ${cfg.defaultMode} dream`);
+    // Edge-trigger bloat alert (one-shot per bloat episode). Either
+    // size OR count crossing HARD counts as bloat — recovery requires
+    // both to be back under SOFT.
+    const sizeBloated = sample.sizeMB >= cfg.hrmHardMB;
+    const countBloated = sample.memoryCount != null && sample.memoryCount >= cfg.memoryHard;
+    const sizeRecovered = sample.sizeMB < cfg.hrmSoftMB;
+    const countRecovered = sample.memoryCount == null || sample.memoryCount < cfg.memorySoft;
+    if ((sizeBloated || countBloated) && !g.bloatedAlerted) {
+      const reason = sizeBloated
+        ? `HRM=${sample.sizeMB.toFixed(1)} MB >= ${cfg.hrmHardMB} MB`
+        : `${sample.memoryCount} memories >= ${cfg.memoryHard}`;
+      logAlert("GROWTH_HRM_BLOATED", `${reason} — kicking ${cfg.defaultMode} dream`);
       g.bloatedAlerted = true;
-    } else if (sample.sizeMB < cfg.hrmSoftMB && g.bloatedAlerted) {
-      logAlert("GROWTH_HRM_RECOVERED", `HRM=${sample.sizeMB.toFixed(1)} MB back under ${cfg.hrmSoftMB} MB`);
+    } else if (sizeRecovered && countRecovered && g.bloatedAlerted) {
+      const where = sample.memoryCount != null ? `${sample.sizeMB.toFixed(1)} MB / ${sample.memoryCount} memories` : `${sample.sizeMB.toFixed(1)} MB`;
+      logAlert("GROWTH_HRM_RECOVERED", `${where} back under SOFT (${cfg.hrmSoftMB} MB / ${cfg.memorySoft} memories)`);
       g.bloatedAlerted = false;
     }
 
@@ -228,13 +253,20 @@ function bootGrowth(deps) {
     if (sample.sizeMB >= cfg.hrmHardMB) {
       return { action: "dream", mode: cfg.defaultMode, reason: `HRM ${sample.sizeMB.toFixed(1)} MB ≥ HARD ${cfg.hrmHardMB} MB` };
     }
+    if (sample.memoryCount != null && sample.memoryCount >= cfg.memoryHard) {
+      return { action: "dream", mode: cfg.defaultMode, reason: `${sample.memoryCount} memories ≥ HARD ${cfg.memoryHard}` };
+    }
     if (sample.sizeMB >= cfg.hrmSoftMB && sinceLast >= cfg.softMinGapMs) {
       return { action: "dream", mode: cfg.defaultMode, reason: `HRM ${sample.sizeMB.toFixed(1)} MB ≥ SOFT ${cfg.hrmSoftMB} MB + ${Math.round(sinceLast / 3600000)}h since last` };
+    }
+    if (sample.memoryCount != null && sample.memoryCount >= cfg.memorySoft && sinceLast >= cfg.softMinGapMs) {
+      return { action: "dream", mode: cfg.defaultMode, reason: `${sample.memoryCount} memories ≥ SOFT ${cfg.memorySoft} + ${Math.round(sinceLast / 3600000)}h since last` };
     }
     if (sinceLast >= cfg.normalIntervalMs) {
       return { action: "dream", mode: cfg.defaultMode, reason: `${Math.round(sinceLast / 3600000)}h since last (normal cadence)` };
     }
-    return { action: "skip", reason: `HRM ${sample.sizeMB.toFixed(1)} MB, last dream ${Math.round(sinceLast / 60000)}m ago` };
+    const countStr = sample.memoryCount != null ? `, ${sample.memoryCount} memories` : "";
+    return { action: "skip", reason: `HRM ${sample.sizeMB.toFixed(1)} MB${countStr}, last dream ${Math.round(sinceLast / 60000)}m ago` };
   }
 
   function tick() {

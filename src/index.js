@@ -1388,18 +1388,26 @@ const server = http.createServer((req, res) => {
 });
 
 // ── Boot Growth (medium maintenance) ────────────────────────
-// Disabled in EXTERNAL_MODE (the radio host owns the HRM — a remote
-// observer can't see the file and shouldn't be scheduling dreams).
+// Growth boots wherever there's a local HRM, regardless of
+// EXTERNAL_MODE. The earlier "disable Growth under EXTERNAL_MODE"
+// rule was wrong — the witness on Oracle-2 IS an EXTERNAL_MODE
+// staff but it owns its own HRM, and that HRM went unsupervised
+// (saw 7753 audio: memories on 2026-05-14 because the radio's
+// Growth couldn't reach the witness file). Now the guard is "does
+// the configured HRM_PATH exist?" — true on both primaries and
+// witness boxes, false on observer-only hosts.
 let growth = null;
-if (!EXTERNAL_MODE) {
+const hrmExists = (() => { try { return require("fs").existsSync(HRM_PATH); } catch { return false; } })();
+if (hrmExists) {
   try {
     growth = bootGrowth({ hrmPath: HRM_PATH, alertsFile: ALERTS_FILE, staffBus });
-    console.log(`[staff] growth online — tick ${Math.round(growth.getState().cfg.tickMs / 60000)}m · HRM thresholds ${growth.getState().cfg.hrmSoftMB}/${growth.getState().cfg.hrmHardMB} MB`);
+    const gs = growth.getState();
+    console.log(`[staff] growth online — tick ${Math.round(gs.cfg.tickMs / 60000)}m · thresholds ${gs.cfg.hrmSoftMB}/${gs.cfg.hrmHardMB} MB or ${gs.cfg.memorySoft}/${gs.cfg.memoryHard} memories`);
   } catch (e) {
     console.warn(`[staff] growth boot failed: ${e.message}`);
   }
 } else {
-  console.log("[staff] growth disabled (EXTERNAL_MODE)");
+  console.log(`[staff] growth disabled — no HRM at ${HRM_PATH}`);
 }
 
 // ── Boot Curator (album-staleness + empty-album watch) ──────
