@@ -1,0 +1,25 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "kannaka-staff",
+  "version": "0.1.0",
+  "description": "Kannaka Staff — agentic production support for the constellation. A watcher service (20+ health probes across radio/observatory/swarm/NATS/disk, a dashboard, and operator action endpoints) plus the `publish-album` release CLI that ships a new album to the live radio host. Skill teaches Claude how to run/observe the watcher, read its alerts, trigger operator actions safely, and drive an album release.",
+  "author": {
+    "name": "flaukowski",
+    "email": "nflach78@gmail.com"
+  },
+  "homepage": "https://github.com/NickFlach/kannaka-staff",
+  "repository": "https://github.com/NickFlach/kannaka-staff",
+  "license": "Space Child License v1.0",
+  "keywords": [
+    "kannaka",
+    "staff",
+    "ops",
+    "monitoring",
+    "health-probes",
+    "watcher",
+    "radio",
+    "constellation",
+    "deploy",
+    "release-automation"
+  ]
+}
