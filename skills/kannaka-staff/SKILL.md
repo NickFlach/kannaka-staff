@@ -42,8 +42,8 @@ Do NOT use for:
 ## The watcher service
 
 ```bash
-npm start                      # node src/index.js  (port 8889)
-node src/index.js --port 8889  # explicit port
+npm start                      # node src/index.js  (PORT env, defaults to 8889)
+node src/index.js --port 8889  # explicit port (this is `npm run watch`)
 ```
 
 Runs as `kannaka-staff.service` in production (`systemd/kannaka-staff.service`). On each
@@ -79,22 +79,27 @@ pgrep, file reads) and witness only over public HTTP.
 | `trigger-showcase?album=NAME&duration=35` | feature an album for N min | low (content) |
 | `trigger-dream` / `growth-dream?mode=lite\|deep` | run a kannaka dream cycle | medium (mutates HRM) |
 | `curator-rescue?force=1` | rescue the oldest-starving album into rotation | low–medium |
-| `distributor-publish?config=PATH` | run a release from an album-config.json | **high (deploys)** |
+| `distributor-publish?config=PATH[&skip=...]` | run a release from an album-config.json (`config` is required) | **high (deploys)** |
 | `creator-request` / `marketer-post` | queue generation / post to socials | medium |
 | `restart-radio` / `restart-observatory` | `sudo systemctl restart …` | **high (prod restart)** |
 
 Auth for non-localhost callers (when `STAFF_SHARED_SECRET` is set): nginx basic-auth **plus**
-an HMAC signature — `X-Staff-Timestamp` and `X-Staff-Signature = sha256_hmac(secret,
-"${TS}\n${METHOD}\n/action/${ACTION}")`, within a 5-minute skew. Prefer running these from
-localhost on the staff host. **Confirm with the user before any `restart-*` or
-`distributor-publish`.**
+an HMAC signature. Send `X-Staff-Timestamp: <ms-epoch>` and
+`X-Staff-Signature = hmac_sha256(secret, "${TS}\n${METHOD}\n${REQUEST_TARGET}")`, where
+**`REQUEST_TARGET` is the full request path INCLUDING the query string, exactly as sent**
+(e.g. `/action/growth-dream?mode=lite`) — NOT just `/action/<action>`. The server signs
+`req.url` (`src/index.js`), so dropping the query string makes the signatures mismatch and
+the call 401s for any action that carries params. Timestamp must be within a 5-minute skew.
+If `STAFF_SHARED_SECRET` is unset, remote calls are refused outright (403) — only localhost
+works. Prefer running these from localhost on the staff host. **Confirm with the user before
+any `restart-*` or `distributor-publish`.**
 
 ### Watcher env
 
-`PORT`, `STAFF_ALERTS_FILE`, `STAFF_HRM_PATH`, `STAFF_RADIO_BASE` (default
-`http://localhost:8888`), `STAFF_STREAM_URL`, `STAFF_OBSERVATORY_BASE` (default
-`http://localhost:3334`), `STAFF_NATS_HOST`/`STAFF_NATS_PORT`, `STAFF_OBSERVER_MODE`,
-`STAFF_SHARED_SECRET`.
+`PORT` (default 8889), `STAFF_ALERTS_FILE`, `STAFF_HRM_PATH`, `STAFF_RADIO_BASE` (default
+`http://localhost:8888`), `STAFF_STREAM_URL` (default `https://radio.ninja-portal.com/stream`),
+`STAFF_OBSERVATORY_BASE` (default `http://localhost:3334`), `STAFF_NATS_HOST`/`STAFF_NATS_PORT`
+(default `swarm.ninja-portal.com:4222`), `STAFF_OBSERVER_MODE`, `STAFF_SHARED_SECRET`.
 
 ---
 
@@ -129,7 +134,8 @@ Other flags: `--ssh-key` (default `~/.ssh/ninja-portal-ed25519`), `--ssh-host` (
 > `--patch` edits the radio repo working tree. Run `--dry-run` first to see exactly what
 > would be SCP'd and patched, show the user, and only escalate to `--deploy`/`--showcase`
 > after they confirm. The default (no escalation flag) is safe — it only uploads files and
-> prints patches.
+> prints patches. If an auto-patch/deploy fails partway, the radio repo working tree may be
+> left partially modified — `git diff` it before committing.
 
 ## Version
 
