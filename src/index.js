@@ -93,7 +93,7 @@ const { bootEar } = require("./staff/ear");
 const { bootStoryteller } = require("./staff/storyteller");
 
 // ── Config ──────────────────────────────────────────────────
-const PORT = parseInt(process.env.PORT || process.argv.includes("--port") ? process.argv[process.argv.indexOf("--port") + 1] : "8889", 10) || 8889;
+const PORT = parseInt(process.env.PORT || (process.argv.includes("--port") ? process.argv[process.argv.indexOf("--port") + 1] : "8889"), 10) || 8889;
 const TICK_MS = 60_000;
 const ALERTS_FILE = process.env.STAFF_ALERTS_FILE || path.join(__dirname, "..", "alerts.jsonl");
 const HRM_PATH = process.env.STAFF_HRM_PATH || path.join(process.env.HOME || "/home/opc", ".kannaka", "kannaka.hrm");
@@ -1180,7 +1180,7 @@ async function refresh() {
     try {
       const [cu, cur] = await Promise.all([
         fetch('/api/curator').then(r => r.json()).catch(() => ({ ok: false })),
-        fetch('/api/album-staleness').then(r => r.json()),
+        fetch('/api/album-staleness').then(r => r.json()).catch(() => ({ ok: false })),
       ]);
       const stale = document.getElementById('staleness');
       let header = '';
