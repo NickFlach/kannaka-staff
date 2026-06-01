@@ -1347,7 +1347,7 @@ const server = http.createServer((req, res) => {
         return;
       }
       // Reject stale timestamps to prevent replay (5 min window).
-      const skew = Math.abs(Date.now() - parseInt(ts, 10) || 0);
+      const skew = Math.abs(Date.now() - (parseInt(ts, 10) || 0));
       if (skew > 5 * 60 * 1000) {
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "timestamp out of window" }));
