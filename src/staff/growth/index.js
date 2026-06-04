@@ -119,7 +119,7 @@ function bootGrowth(deps) {
     bloatedAlerted: false,      // edge-trigger for GROWTH_HRM_BLOATED
   };
 
-  // ── load persisted state on boot (best-effort) ──────────────
+  // ── load persisted state on boot (best-effort) ──────────
   try {
     if (fs.existsSync(STATE_FILE)) {
       const persisted = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
@@ -162,7 +162,7 @@ function bootGrowth(deps) {
     console.log(`[growth] ${transition}: ${message}`);
   }
 
-  // ── HRM sampling ────────────────────────────────────────────
+  // ── HRM sampling ────────────────────────────
   function sampleHrm() {
     let sizeMB = null;
     try {
@@ -183,7 +183,7 @@ function bootGrowth(deps) {
     return { sizeMB, memoryCount };
   }
 
-  // ── dream launcher ──────────────────────────────────────────
+  // ── dream launcher ────────────────────────────
   function launchDream(mode, reason) {
     if (g.inFlight) {
       console.log(`[growth] dream already in flight (${g.inFlight.mode}); skip ${reason}`);
@@ -218,14 +218,13 @@ function bootGrowth(deps) {
     g.inFlight = { startedAt, mode, reason, pid: child.pid };
   }
 
-  // ── tick — decide whether to launch ─────────────────────────
-  function decide() {
+  // ── tick — decide whether to launch ─────────────────────
+  function decide(sample) {
     if (!cfg.enabled) return null;
     if (g.inFlight) {
       const inFlightAge = Date.now() - g.inFlight.startedAt;
       return { action: "wait", reason: `dream in flight (${g.inFlight.mode}, ${Math.round(inFlightAge / 1000)}s)` };
     }
-    const sample = sampleHrm();
     if (sample.sizeMB == null) return { action: "skip", reason: "HRM not readable on this host" };
 
     // Edge-trigger bloat alert (one-shot per bloat episode). Either
@@ -274,7 +273,7 @@ function bootGrowth(deps) {
     g.hrmHistory.push({ ts: Date.now(), sizeMB: sample.sizeMB, memoryCount: sample.memoryCount });
     if (g.hrmHistory.length > DEFAULTS.HRM_HISTORY_MAX) g.hrmHistory.shift();
 
-    const decision = decide();
+    const decision = decide(sample);
     g.lastTick = { ts: Date.now(), decision, sample };
     if (decision && decision.action === "dream") {
       launchDream(decision.mode, decision.reason);
