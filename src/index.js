@@ -1622,6 +1622,19 @@ server.listen(PORT, () => {
   console.log(`[staff] probing every ${TICK_MS / 1000}s`);
 });
 
+// Test/CI safety: self-destruct after a TTL so a smoke-test can never leak a
+// stray server. On Windows/Git Bash `node … & kill $!` often misses the real
+// node.exe PID, orphaning the server for weeks; this guarantees cleanup.
+// Prod leaves KANNAKA_TEST_TTL_MS unset → no timer.
+const TEST_TTL_MS = Number(process.env.KANNAKA_TEST_TTL_MS) || 0;
+if (TEST_TTL_MS > 0) {
+  console.log(`[staff] KANNAKA_TEST_TTL_MS=${TEST_TTL_MS} — auto-shutdown armed`);
+  setTimeout(() => {
+    console.log("[staff] test TTL reached — self-destructing");
+    shutdown();
+  }, TEST_TTL_MS).unref();
+}
+
 // First tick immediate, then on interval.
 tick().catch((e) => console.error("[staff] first tick:", e));
 setInterval(() => tick().catch((e) => console.error("[staff] tick:", e)), TICK_MS);
