@@ -198,7 +198,7 @@ function patchProgramming() {
   for (const blockLabel of blocks) {
     // Find the SCHEDULE entry whose `label: '<block>'` matches.
     // Then in the same block object, find `albums: [` and prepend our entry.
-    const labelRe = new RegExp(`label:\\s*['"\`]${blockLabel.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}['"\`]`);
+    const labelRe = new RegExp(`label:\\s*['"\`]${blockLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}['"\`]`);
     const labelMatch = labelRe.exec(src);
     if (!labelMatch) {
       console.log(`  ⚠ block label '${blockLabel}' not found — skipping`);
