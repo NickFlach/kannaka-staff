@@ -90,11 +90,11 @@ function bootMarketer(deps) {
       child.stdout.on("data", (c) => out += c.toString("utf8"));
       child.stderr.on("data", (c) => err += c.toString("utf8"));
       const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch (_) {} }, cfg.timeoutMs);
-      child.on("close", (code) => {
+      child.on("close", (exitCode) => {
         clearTimeout(timer);
         let results = null;
         try { results = JSON.parse(out.trim().split("\n").pop()); } catch (_) {}
-        resolve({ ok: code === 0 && Array.isArray(results), exit: code, results, stderr: err.slice(-400) });
+        resolve({ ok: exitCode === 0 && Array.isArray(results), exit: exitCode, results, stderr: err.slice(-400) });
       });
       child.on("error", (e) => { clearTimeout(timer); resolve({ ok: false, exit: null, error: e.message }); });
     });

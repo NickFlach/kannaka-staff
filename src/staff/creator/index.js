@@ -180,6 +180,15 @@ function bootCreator(deps) {
         c.current = null;
         logAlert(ok ? "CREATOR_JOB_DONE" : "CREATOR_JOB_FAILED", message);
         persist();
+      })
+      .catch((e) => {
+        const finishedAt = Date.now();
+        const message = `${id} FAILED kind=${kind} (unhandled error): ${e.message}`;
+        c.history.push({ id, kind, startedAt, finishedAt, ok: false, status: 0, message, query });
+        if (c.history.length > DEFAULTS.HISTORY_MAX) c.history.shift();
+        c.current = null;
+        logAlert("CREATOR_JOB_FAILED", message);
+        persist();
       });
     return { ok: true, jobId: id, kind };
   }
