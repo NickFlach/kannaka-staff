@@ -286,7 +286,7 @@ function probeMetadataMountAlignment() {
 const _streamTracker = { title: null, lastChangeAt: 0 };
 async function probeStreamMetadataAdvancing() {
   const r = await probeHttp("http://127.0.0.1:8000/status-json.xsl", { timeout: 5000 });
-  if (!r.ok) return { ok: false, message: `icecast status-json: ${r.message || r.status}` };
+  if (!r.ok) return { ok: false, message: `icecast status-json: ${r.error || r.status}` };
   let stream;
   try {
     const d = JSON.parse(r.body).icestats;
