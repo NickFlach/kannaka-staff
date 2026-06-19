@@ -153,6 +153,7 @@ function bootDistributor(deps) {
       logTail: [],
       timeoutHandle: null,
     };
+    let finalized = false;
 
     const env = { ...process.env };
     if (skip) env.RELEASE_SKIP = skip;
@@ -179,6 +180,8 @@ function bootDistributor(deps) {
     }, cfg.jobTimeoutMs);
 
     child.on("close", (code, signal) => {
+      if (finalized) return;
+      finalized = true;
       clearTimeout(job.timeoutHandle);
       const finishedAt = Date.now();
       const ok = code === 0 && !signal;
@@ -199,6 +202,8 @@ function bootDistributor(deps) {
     });
 
     child.on("error", (err) => {
+      if (finalized) return;
+      finalized = true;
       // spawn-time failure (script missing, EACCES, etc.)
       const finishedAt = Date.now();
       const message = `${id} FAILED to spawn: ${err.message}`;
