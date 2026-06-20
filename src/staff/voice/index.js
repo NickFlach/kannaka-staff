@@ -50,11 +50,13 @@ function probeJson(target, timeoutMs = 5000) {
     }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
-      res.on("end", () => {
+      const settle = () => {
         const text = Buffer.concat(chunks).toString("utf8");
         try { resolve({ ok: res.statusCode < 400, json: JSON.parse(text) }); }
         catch (_) { resolve({ ok: false, json: null, raw: text.slice(0, 400) }); }
-      });
+      };
+      res.on("end", settle);
+      res.on("close", settle);
     });
     req.on("error", (e) => resolve({ ok: false, error: e.message }));
     req.on("timeout", () => req.destroy(new Error("timeout")));
