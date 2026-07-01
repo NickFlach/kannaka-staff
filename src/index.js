@@ -43,6 +43,85 @@ const url = require("url");
 const crypto = require("crypto");
 const { EventEmitter } = require("events");
 
+// ── Pure helpers (exported for tests; see tests/) ────────────
+// Extracted from the inline logic below so the suite can exercise the
+// load-bearing decisions — HMAC auth, cooldown gating, probe→alert
+// hysteresis, PORT parsing, bus-event summarization — without booting
+// the watcher or touching the network. Every call site below is wired
+// to the matching helper; behavior is unchanged.
+
+/** PORT resolution: env PORT wins, then `--port N` argv, then 8889 (#20). */
+function parsePort(env, argv) {
+  const fromArgv = argv.includes("--port") ? argv[argv.indexOf("--port") + 1] : "8889";
+  return parseInt(env.PORT || fromArgv, 10) || 8889;
+}
+
+/**
+ * Decide whether a POST /action request is authorized. Localhost is
+ * always allowed; remote callers need STAFF_SHARED_SECRET plus a valid
+ * HMAC over `${ts}\n${method}\n${reqUrl}` inside the skew window.
+ * Returns { ok, code, error? }.
+ *
+ * #21 regression: a non-numeric X-Staff-Timestamp must NOT collapse the
+ * skew to 0 (which would let a replay slip through). `parseInt(...) || 0`
+ * turns NaN into 0, so skew becomes ~now and the request is rejected as
+ * out-of-window — exactly what the test locks in.
+ */
+function verifyStaffHmac({ secret, isLocal, sig, ts, method, reqUrl, now = Date.now(), skewMs = 5 * 60 * 1000 }) {
+  if (isLocal) return { ok: true, code: 200 };
+  if (!secret) return { ok: false, code: 403, error: "remote calls require STAFF_SHARED_SECRET" };
+  if (!sig || !ts) return { ok: false, code: 401, error: "missing X-Staff-Signature / X-Staff-Timestamp" };
+  const skew = Math.abs(now - (parseInt(ts, 10) || 0));
+  if (skew > skewMs) return { ok: false, code: 401, error: "timestamp out of window" };
+  const expected = crypto.createHmac("sha256", secret).update(`${ts}\n${method}\n${reqUrl}`).digest("hex");
+  let ok = false;
+  try {
+    ok = crypto.timingSafeEqual(Buffer.from(String(sig), "hex"), Buffer.from(expected, "hex"));
+  } catch (_) { /* length/hex mismatch → ok stays false */ }
+  if (!ok) return { ok: false, code: 401, error: "bad signature" };
+  return { ok: true, code: 200 };
+}
+
+/** ms remaining on a cooldown, or 0 if the action may fire now. */
+function cooldownRemainingMs(lastTs, cooldownMs, now = Date.now()) {
+  const sinceLast = now - lastTs;
+  return sinceLast < cooldownMs ? cooldownMs - sinceLast : 0;
+}
+
+/**
+ * Hysteresis: a probe is "officially failing" only after confirmTicks
+ * consecutive failures; a single success recovers immediately. `history`
+ * already includes the current tick's result.
+ */
+function computeEffectiveOk(prevEffectiveOk, history, currentOk, confirmTicks) {
+  if (currentOk) return true;
+  const tail = history.slice(-confirmTicks);
+  const allFailing = tail.length >= confirmTicks && tail.every((h) => !h.ok);
+  return prevEffectiveOk ? !allFailing : false;
+}
+
+/** Alert transition label for an effective-state change, or null if unchanged. */
+function transitionFor(prevEffectiveOk, effectiveOk) {
+  if (effectiveOk === prevEffectiveOk) return null;
+  return effectiveOk ? "RECOVERED" : "FAILED";
+}
+
+/** Build a busRing entry for a KANNAKA.* event, or null to skip (ADR-003). */
+function summarizeBusEvent(subject, event) {
+  if (typeof subject !== "string" || !subject.startsWith("KANNAKA.")) return null;
+  let summary;
+  try {
+    const s = JSON.stringify((event && event.payload) || {});
+    summary = s.length > 200 ? s.slice(0, 200) + "…" : s;
+  } catch { summary = "(unserializable)"; }
+  return {
+    ts: (event && event.ts) || Date.now(),
+    source: (event && event.source) || "?",
+    subject,
+    summary,
+  };
+}
+
 // staffBus — per ADR-003, the in-process notification bus that lets
 // roles react to each other in real time without going through NATS.
 // Subjects use the same KANNAKA.staff.<verb>.<resource> namespace so
@@ -65,19 +144,9 @@ const _busEmit = staffBus.emit.bind(staffBus);
 staffBus.emit = function (subject, event) {
   // Only ring our own KANNAKA.* subjects — EventEmitter has internal
   // events (newListener, removeListener, error) we shouldn't log.
-  if (typeof subject === "string" && subject.startsWith("KANNAKA.")) {
-    busRing.push({
-      ts: (event && event.ts) || Date.now(),
-      source: (event && event.source) || "?",
-      subject,
-      // Stringify payload defensively — small payloads only.
-      summary: (() => {
-        try {
-          const s = JSON.stringify((event && event.payload) || {});
-          return s.length > 200 ? s.slice(0, 200) + "…" : s;
-        } catch { return "(unserializable)"; }
-      })(),
-    });
+  const entry = summarizeBusEvent(subject, event);
+  if (entry) {
+    busRing.push(entry);
     if (busRing.length > BUS_RING_MAX) busRing.shift();
   }
   return _busEmit(subject, event);
@@ -93,7 +162,7 @@ const { bootEar } = require("./staff/ear");
 const { bootStoryteller } = require("./staff/storyteller");
 
 // ── Config ──────────────────────────────────────────────────
-const PORT = parseInt(process.env.PORT || (process.argv.includes("--port") ? process.argv[process.argv.indexOf("--port") + 1] : "8889"), 10) || 8889;
+const PORT = parsePort(process.env, process.argv);
 const TICK_MS = 60_000;
 const ALERTS_FILE = process.env.STAFF_ALERTS_FILE || path.join(__dirname, "..", "alerts.jsonl");
 const HRM_PATH = process.env.STAFF_HRM_PATH || path.join(process.env.HOME || "/home/opc", ".kannaka", "kannaka.hrm");
@@ -809,20 +878,11 @@ async function tick() {
     // last FAIL_CONFIRM_TICKS are all failures; otherwise effective is
     // ok=true. Single successes recover immediately.
     const prevEffectiveOk = prev ? (prev.effectiveOk !== undefined ? prev.effectiveOk : prev.ok) : true;
-    let effectiveOk;
-    if (current.ok) {
-      effectiveOk = true;
-    } else {
-      const tail = history.slice(-FAIL_CONFIRM_TICKS);
-      const allFailing = tail.length >= FAIL_CONFIRM_TICKS && tail.every(h => !h.ok);
-      // If we were already officially failing, stay failing; otherwise
-      // only flip after the confirm window fills with failures.
-      effectiveOk = prevEffectiveOk ? !allFailing : false;
-    }
+    const effectiveOk = computeEffectiveOk(prevEffectiveOk, history, current.ok, FAIL_CONFIRM_TICKS);
     current.effectiveOk = effectiveOk;
 
-    if (effectiveOk !== prevEffectiveOk) {
-      const transition = effectiveOk ? "RECOVERED" : "FAILED";
+    const transition = transitionFor(prevEffectiveOk, effectiveOk);
+    if (transition) {
       const entry = {
         ts: new Date(current.ts).toISOString(),
         probe: name,
@@ -1338,40 +1398,22 @@ const server = http.createServer((req, res) => {
     const secret = process.env.STAFF_SHARED_SECRET;
     const remote = req.socket.remoteAddress || "";
     const isLocal = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
-    if (secret && !isLocal) {
-      const sig = req.headers["x-staff-signature"];
-      const ts = req.headers["x-staff-timestamp"];
-      if (!sig || !ts) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "missing X-Staff-Signature / X-Staff-Timestamp" }));
-        return;
-      }
-      // Reject stale timestamps to prevent replay (5 min window).
-      const skew = Math.abs(Date.now() - (parseInt(ts, 10) || 0));
-      if (skew > 5 * 60 * 1000) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "timestamp out of window" }));
-        return;
-      }
-      const expected = crypto.createHmac("sha256", secret)
-        .update(`${ts}\n${req.method}\n${req.url}`)
-        .digest("hex");
-      let ok = false;
-      try {
-        ok = crypto.timingSafeEqual(Buffer.from(sig, "hex"), Buffer.from(expected, "hex"));
-      } catch (_) { /* length mismatch → ok stays false */ }
-      if (!ok) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "bad signature" }));
-        return;
-      }
-    } else if (!secret && !isLocal) {
-      // No secret configured AND not local — refuse remote calls entirely.
-      res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: false, error: "remote calls require STAFF_SHARED_SECRET" }));
+    // Reject stale timestamps to prevent replay (5 min window). Localhost
+    // bypasses; remote callers must present a valid HMAC (verifyStaffHmac).
+    const auth = verifyStaffHmac({
+      secret,
+      isLocal,
+      sig: req.headers["x-staff-signature"],
+      ts: req.headers["x-staff-timestamp"],
+      method: req.method,
+      reqUrl: req.url,
+    });
+    if (!auth.ok) {
+      res.writeHead(auth.code, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: auth.error }));
       return;
     }
-    // else: localhost (always allowed) OR signed remote (verified above)
+    // authorized: localhost (always allowed) OR signed remote (verified above)
     handleAction(action, url.parse(req.url, true).query)
       .then((r) => {
         res.writeHead(r.ok ? 200 : 500, { "Content-Type": "application/json" });
@@ -1386,6 +1428,22 @@ const server = http.createServer((req, res) => {
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("404");
 });
+
+// ── Test seam ────────────────────────────────────────────────
+// Export the pure helpers so tests/ can drive them, and skip every
+// boot side-effect below (role timers, HTTP listen, probe ticks and
+// the NATS/radio/observatory/external calls they make) when this file
+// is require()d rather than run directly. `node src/index.js` keeps
+// require.main === module, so production boot is unaffected.
+module.exports = {
+  parsePort,
+  verifyStaffHmac,
+  cooldownRemainingMs,
+  computeEffectiveOk,
+  transitionFor,
+  summarizeBusEvent,
+};
+if (require.main !== module) return;
 
 // ── Boot Growth (medium maintenance) ────────────────────────
 // Growth boots wherever there's a local HRM, regardless of
@@ -1507,10 +1565,9 @@ const AUTO_RECOVER = {
   cooldownMs: parseInt(process.env.AUTO_RECOVER_COOLDOWN_MS || "", 10) || 30 * 60 * 1000,
 };
 function runAutoRecoverRestart(reason) {
-  const sinceLast = Date.now() - AUTO_RECOVER.lastRestartTs;
-  if (sinceLast < AUTO_RECOVER.cooldownMs) {
-    const mins = Math.round((AUTO_RECOVER.cooldownMs - sinceLast) / 60000);
-    console.log(`[auto-recover] ${reason} — cooldown active (${mins}m remaining)`);
+  const remaining = cooldownRemainingMs(AUTO_RECOVER.lastRestartTs, AUTO_RECOVER.cooldownMs);
+  if (remaining > 0) {
+    console.log(`[auto-recover] ${reason} — cooldown active (${Math.round(remaining / 60000)}m remaining)`);
     return;
   }
   AUTO_RECOVER.lastRestartTs = Date.now();
@@ -1562,8 +1619,9 @@ const AUTO_RESCUE = {
 };
 async function fireRescue(reason) {
   if (!curator) return { ok: false, error: "curator not online" };
-  const sinceLast = Date.now() - AUTO_RESCUE.lastRescueTs;
-  if (sinceLast < AUTO_RESCUE.cooldownMs) {
+  const now = Date.now();
+  const sinceLast = now - AUTO_RESCUE.lastRescueTs;
+  if (cooldownRemainingMs(AUTO_RESCUE.lastRescueTs, AUTO_RESCUE.cooldownMs, now) > 0) {
     const hrs = Math.round((AUTO_RESCUE.cooldownMs - sinceLast) / 3600000);
     return { ok: false, error: `cooldown active (${hrs}h remaining)` };
   }

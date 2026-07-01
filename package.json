@@ -5,7 +5,8 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "watch": "node src/index.js --port 8889"
+    "watch": "node src/index.js --port 8889",
+    "test": "node --test tests/*.test.js"
   },
   "license": "Space Child License v1.0",
   "author": "Kannaka constellation"
