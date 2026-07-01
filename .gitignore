@@ -3,3 +3,4 @@ node_modules/
 build/
 growth-state.json
 alerts.jsonl
+ear-state.json
