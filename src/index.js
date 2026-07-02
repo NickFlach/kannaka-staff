@@ -259,7 +259,7 @@ function probeStreamHead(target, timeoutMs = 5000) {
         }
       });
       res.on("end", () => resolve({ ok: bytes > 0, status, bytes }));
-      res.on("close", () => { /* settle handled above */ });
+      res.on("close", () => resolve({ ok: bytes > 0, status, bytes }));
     });
     req.on("error", (e) => resolve({ ok: false, status: 0, error: e.message }));
     req.on("timeout", () => req.destroy(new Error("timeout")));
