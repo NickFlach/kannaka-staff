@@ -80,11 +80,12 @@ function probeHttpJson(target, timeoutMs = 5000, maxBody = 200 * 1024) {
         bytes += c.length;
         if (bytes < maxBody) chunks.push(c);
       });
-      res.on("end", () => {
+      const settle = () => {
         const body = Buffer.concat(chunks).toString("utf8").slice(0, maxBody);
-        const ok = res.statusCode >= 200 && res.statusCode < 400;
-        resolve({ ok, status: res.statusCode, body });
-      });
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 400, status: res.statusCode, body });
+      };
+      res.on("end", settle);
+      res.on("close", settle);
     });
     req.on("error", (e) => resolve({ ok: false, status: 0, error: e.message }));
     req.on("timeout", () => req.destroy(new Error("timeout")));

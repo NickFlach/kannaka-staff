@@ -42,7 +42,7 @@
  */
 "use strict";
 
-const { exec, execFile } = require("child_process");
+const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 

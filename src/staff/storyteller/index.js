@@ -25,10 +25,8 @@
  */
 "use strict";
 
-const fs = require("fs");
 const http = require("http");
 const https = require("https");
-const path = require("path");
 const url = require("url");
 
 const DEFAULTS = {
@@ -53,11 +51,13 @@ function probeJson(target, timeoutMs = 5000) {
     }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
-      res.on("end", () => {
+      const settle = () => {
         const text = Buffer.concat(chunks).toString("utf8");
         try { resolve({ ok: res.statusCode < 400, json: JSON.parse(text) }); }
         catch (_) { resolve({ ok: false, raw: text.slice(0, 400) }); }
-      });
+      };
+      res.on("end", settle);
+      res.on("close", settle);
     });
     req.on("error", (e) => resolve({ ok: false, error: e.message }));
     req.on("timeout", () => req.destroy(new Error("timeout")));
@@ -67,7 +67,6 @@ function probeJson(target, timeoutMs = 5000) {
 
 function bootStoryteller(deps) {
   const RADIO_BASE = deps.radioBase;
-  const ALERTS_FILE = deps.alertsFile;
 
   const cfg = {
     tickMs: readEnvMs("STORYTELLER_TICK_MS", DEFAULTS.TICK_MS),
