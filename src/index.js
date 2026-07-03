@@ -216,11 +216,13 @@ function probeHttp(target, opts = {}) {
         bytes += c.length;
         chunks.push(c);
       });
-      res.on("end", () => {
+      const settle = () => {
         const body = Buffer.concat(chunks).toString("utf8").slice(0, maxBody);
         const ok = res.statusCode >= 200 && res.statusCode < 400;
         resolve({ ok, status: res.statusCode, body, bytes });
-      });
+      };
+      res.on("end", settle);
+      res.on("close", settle);
     });
     req.on("error", (e) => resolve({ ok: false, status: 0, error: e.message }));
     req.on("timeout", () => { req.destroy(new Error("timeout")); });
@@ -1633,6 +1635,7 @@ async function fireRescue(reason) {
   return new Promise((resolve) => {
     const lib = url.parse(u).protocol === "https:" ? https : http;
     const uu = url.parse(u);
+    let settled = false;
     const req = lib.request({
       method: "POST",
       hostname: uu.hostname,
@@ -1642,7 +1645,9 @@ async function fireRescue(reason) {
     }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
-      res.on("end", () => {
+      const settle = () => {
+        if (settled) return;
+        settled = true;
         const ok = res.statusCode >= 200 && res.statusCode < 400;
         const entry = {
           ts: new Date().toISOString(),
@@ -1653,9 +1658,12 @@ async function fireRescue(reason) {
         try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(entry) + "\n"); } catch (_) {}
         console.log(`[auto-rescue] ${entry.transition}: ${entry.message}`);
         resolve({ ok, album: target.album, durationMin: AUTO_RESCUE.durationMin, status: res.statusCode });
-      });
+      };
+      res.on("end", settle);
+      res.on("close", settle);
     });
     req.on("error", (e) => {
+      if (settled) return;
       // roll back the rate-limit stamp on transport failure so the next
       // tick can retry — we don't want a network blip to consume the
       // 24h slot.
