@@ -338,7 +338,7 @@ async function probeRadioPortAlive() {
 // environ is hidden by systemd hardening).
 function probeMetadataMountAlignment() {
   return new Promise((resolve) => {
-    require("fs").readFile("/home/opc/run-radio.sh", "utf8", (err, content) => {
+    fs.readFile("/home/opc/run-radio.sh", "utf8", (err, content) => {
       if (err) return resolve({ ok: false, message: `cannot read run-radio.sh: ${err.message}` });
       const m = content.match(/^\s*export\s+ICECAST_MOUNT=(\S+)/m);
       const mount = m ? m[1].replace(/['"]/g, "") : "/preview";
@@ -406,8 +406,6 @@ async function probePodcastFilesPlayable() {
   const cooldown = _lastPodcastResult.ok ? 60 * 60 * 1000 : 5 * 60 * 1000;
   if (now - _lastPodcastProbeAt < cooldown) return _lastPodcastResult;
   _lastPodcastProbeAt = now;
-  const fs = require("fs");
-  const path = require("path");
   if (!fs.existsSync(PODCAST_DIR)) {
     _lastPodcastResult = { ok: true, message: "no podcast dir" };
     return _lastPodcastResult;
@@ -1457,7 +1455,7 @@ if (require.main !== module) return;
 // the configured HRM_PATH exist?" — true on both primaries and
 // witness boxes, false on observer-only hosts.
 let growth = null;
-const hrmExists = (() => { try { return require("fs").existsSync(HRM_PATH); } catch { return false; } })();
+const hrmExists = (() => { try { return fs.existsSync(HRM_PATH); } catch { return false; } })();
 if (hrmExists) {
   try {
     growth = bootGrowth({ hrmPath: HRM_PATH, alertsFile: ALERTS_FILE, staffBus });
@@ -1490,7 +1488,7 @@ if (!EXTERNAL_MODE) {
   try {
     distributor = bootDistributor({ alertsFile: ALERTS_FILE, staffBus });
     const ds = distributor.getState();
-    const scriptOk = require("fs").existsSync(ds.cfg.releaseScript);
+    const scriptOk = fs.existsSync(ds.cfg.releaseScript);
     console.log(`[staff] distributor online — release script ${scriptOk ? "ok" : "MISSING"} at ${ds.cfg.releaseScript} · timeout ${Math.round(ds.cfg.jobTimeoutMs / 60000)}m`);
   } catch (e) {
     console.warn(`[staff] distributor boot failed: ${e.message}`);
@@ -1515,7 +1513,7 @@ if (!EXTERNAL_MODE) {
   try {
     marketer = bootMarketer({ alertsFile: ALERTS_FILE, staffBus });
     const ms = marketer.getState();
-    const radioOk = require("fs").existsSync(require("path").join(ms.cfg.radioRepo, "server/broadcasters"));
+    const radioOk = fs.existsSync(path.join(ms.cfg.radioRepo, "server/broadcasters"));
     console.log(`[staff] marketer online — broadcasters ${radioOk ? "ok" : "MISSING"} at ${ms.cfg.radioRepo}/server/broadcasters`);
   } catch (e) {
     console.warn(`[staff] marketer boot failed: ${e.message}`);
