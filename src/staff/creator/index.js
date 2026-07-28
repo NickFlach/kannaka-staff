@@ -56,11 +56,13 @@ function postJson(target, body, timeoutMs) {
     }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
-      res.on("end", () => {
+      const settle = () => {
         const text = Buffer.concat(chunks).toString("utf8").slice(0, 4000);
         const ok = res.statusCode >= 200 && res.statusCode < 400;
         resolve({ ok, status: res.statusCode, body: text });
-      });
+      };
+      res.on("end", settle);
+      res.on("close", settle);
     });
     req.on("error", (e) => resolve({ ok: false, status: 0, error: e.message }));
     req.on("timeout", () => req.destroy(new Error("timeout")));
@@ -143,10 +145,12 @@ function bootCreator(deps) {
         }, (res) => {
           const chunks = [];
           res.on("data", (c) => chunks.push(c));
-          res.on("end", () => {
+          const settle = () => {
             const text = Buffer.concat(chunks).toString("utf8").slice(0, 4000);
             resolve({ ok: res.statusCode >= 200 && res.statusCode < 400, status: res.statusCode, body: text });
-          });
+          };
+          res.on("end", settle);
+          res.on("close", settle);
         });
         req.on("error", (e) => resolve({ ok: false, status: 0, error: e.message }));
         req.on("timeout", () => req.destroy(new Error("timeout")));
