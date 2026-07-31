@@ -793,62 +793,6 @@ async function runAllProbes() {
   return results;
 }
 
-// ── Curator: album-staleness audit ──────────────────────────
-//
-// Uses kannaka-radio's /api/history endpoint to compute per-album
-// last-played time. The watcher dashboard surfaces "stale albums"
-// (no plays in N hours) so we can see when the rotation is starving
-// half the catalog.
-async function fetchAlbumStaleness() {
-  const r = await probeHttp(`${RADIO_BASE}/api/history?limit=200`, { timeout: 5000, maxBody: 200 * 1024 });
-  if (!r.ok) return { ok: false, message: `HTTP ${r.status} ${r.error || ""}`, albums: [] };
-  let hist;
-  try { hist = JSON.parse(r.body).history || []; }
-  catch (e) { return { ok: false, message: `parse: ${e.message}`, albums: [] }; }
-
-  const now = Date.now();
-  const lastByAlbum = {};
-  const countByAlbum = {};
-  for (const h of hist) {
-    if (!h.album || h.commercial) continue;
-    countByAlbum[h.album] = (countByAlbum[h.album] || 0) + 1;
-    if (!lastByAlbum[h.album] || (h.playedAt || 0) > lastByAlbum[h.album]) {
-      lastByAlbum[h.album] = h.playedAt || 0;
-    }
-  }
-
-  // Also fetch the radio's full album list so we can flag albums that
-  // never appeared in the last-200 history.
-  const stateR = await probeHttp(`${RADIO_BASE}/api/state`, { timeout: 5000, maxBody: 200 * 1024 });
-  let allAlbums = [];
-  if (stateR.ok) {
-    try {
-      const s = JSON.parse(stateR.body);
-      allAlbums = (s.albums || []).map((a) => a.name || a);
-    } catch (_) { /* ignore */ }
-  }
-
-  const albums = [];
-  for (const album of new Set([...allAlbums, ...Object.keys(lastByAlbum)])) {
-    const last = lastByAlbum[album] || 0;
-    const ageMs = last ? now - last : null;
-    albums.push({
-      album,
-      lastPlayed: last || null,
-      ageMs,
-      playsInWindow: countByAlbum[album] || 0,
-    });
-  }
-  // Sort: never-played first (ageMs null), then oldest first.
-  albums.sort((a, b) => {
-    if (a.ageMs == null && b.ageMs == null) return 0;
-    if (a.ageMs == null) return -1;
-    if (b.ageMs == null) return 1;
-    return b.ageMs - a.ageMs;
-  });
-  return { ok: true, albums, historyLen: hist.length };
-}
-
 // ── Tick loop ───────────────────────────────────────────────
 async function tick() {
   let probeResults;
@@ -1235,8 +1179,8 @@ async function refresh() {
     ]);
 
     // Curator panel — pull classification summary from /api/curator
-    // (the Curator role) and the per-album list from /api/album-staleness
-    // (the watcher's read-only helper that pre-existed the role).
+    // and the per-album list from /api/album-staleness (delegates to
+    // curator's cached snapshot, same data refreshed on the 30-min tick).
     try {
       const [cu, cur] = await Promise.all([
         fetch('/api/curator').then(r => r.json()).catch(() => ({ ok: false })),
@@ -1323,15 +1267,9 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.url === "/api/album-staleness") {
-    fetchAlbumStaleness()
-      .then((r) => {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(r));
-      })
-      .catch((e) => {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: e.message }));
-      });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    const snap = curator ? curator.getState().snapshot : null;
+    res.end(JSON.stringify(snap || { ok: false, message: curator ? "curator not yet initialized" : "curator not online" }));
     return;
   }
   if (req.url === "/api/growth") {
