@@ -1267,9 +1267,20 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.url === "/api/album-staleness") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    const snap = curator ? curator.getState().snapshot : null;
-    res.end(JSON.stringify(snap || { ok: false, message: curator ? "curator not yet initialized" : "curator not online" }));
+    try {
+      const st = curator ? curator.getState() : null;
+      // Include lastTick so callers can detect a stale snapshot (e.g. radio
+      // was down for the last N ticks — snapshot.ok is still true but
+      // lastTick reveals how old the data is).
+      const body = (st && st.snapshot)
+        ? { ...st.snapshot, lastTick: st.lastTick }
+        : { ok: false, message: curator ? "curator not yet initialized" : "curator not online" };
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
     return;
   }
   if (req.url === "/api/growth") {
