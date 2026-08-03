@@ -46,6 +46,8 @@ const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
+const { readEnvMs } = require("../util");
+
 const DEFAULTS = {
   TICK_MS: 15 * 60 * 1000,            // 15 min
   // Size-based thresholds are tuned for the primary HRM (37 MB typical,
@@ -72,11 +74,6 @@ const DEFAULTS = {
   DREAM_HISTORY_MAX: 20,
   HRM_HISTORY_MAX: 96,                       // 96 × 15min = 24h trend
 };
-
-function readEnvMs(name, fallback) {
-  const v = parseInt(process.env[name] || "", 10);
-  return Number.isFinite(v) && v > 0 ? v : fallback;
-}
 
 function readEnvMB(name, fallback) {
   const v = parseFloat(process.env[name] || "");

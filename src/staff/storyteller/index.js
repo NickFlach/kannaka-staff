@@ -29,14 +29,11 @@ const http = require("http");
 const https = require("https");
 const url = require("url");
 
+const { readEnvMs } = require("../util");
+
 const DEFAULTS = {
   TICK_MS: 5 * 60 * 1000,
 };
-
-function readEnvMs(name, fallback) {
-  const v = parseInt(process.env[name] || "", 10);
-  return Number.isFinite(v) && v > 0 ? v : fallback;
-}
 
 function probeJson(target, timeoutMs = 5000) {
   return new Promise((resolve) => {

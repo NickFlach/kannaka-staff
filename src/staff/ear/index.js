@@ -30,6 +30,8 @@ const https = require("https");
 const path = require("path");
 const url = require("url");
 
+const { readEnvMs } = require("../util");
+
 const DEFAULTS = {
   TICK_MS: 2 * 60 * 1000,
   SAMPLE_BYTES: 8 * 1024,
@@ -38,11 +40,6 @@ const DEFAULTS = {
   // sections will exceed this. True dead air sits near 0.
   SILENCE_VARIANCE_THRESHOLD: 50,
 };
-
-function readEnvMs(name, fallback) {
-  const v = parseInt(process.env[name] || "", 10);
-  return Number.isFinite(v) && v > 0 ? v : fallback;
-}
 
 function sampleStream(target, sampleBytes, timeoutMs = 8000) {
   return new Promise((resolve) => {
