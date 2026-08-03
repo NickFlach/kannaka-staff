@@ -1580,8 +1580,8 @@ async function fireRescue(reason) {
   AUTO_RESCUE.lastRescueTs = Date.now();
   const u = `${RADIO_BASE}/api/album/showcase?album=${encodeURIComponent(target.album)}&duration=${AUTO_RESCUE.durationMin}`;
   return new Promise((resolve) => {
-    const lib = url.parse(u).protocol === "https:" ? https : http;
     const uu = url.parse(u);
+    const lib = uu.protocol === "https:" ? https : http;
     let settled = false;
     const req = lib.request({
       method: "POST",
@@ -1611,6 +1611,7 @@ async function fireRescue(reason) {
     });
     req.on("error", (e) => {
       if (settled) return;
+      settled = true;
       // roll back the rate-limit stamp on transport failure so the next
       // tick can retry — we don't want a network blip to consume the
       // 24h slot.
