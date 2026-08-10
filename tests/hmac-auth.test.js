@@ -14,7 +14,7 @@ process.env.KANNAKA_TEST_TTL_MS = process.env.KANNAKA_TEST_TTL_MS || "5000";
 const test = require("node:test");
 const assert = require("node:assert");
 const crypto = require("node:crypto");
-const { verifyStaffHmac } = require("../src/index.js");
+const { verifyStaffHmac, isLocalCaller, actionAvailability } = require("../src/index.js");
 
 const SECRET = "test-shared-secret";
 const METHOD = "POST";
@@ -113,4 +113,61 @@ test("timestamp exactly at the window edge is still accepted", () => {
   const sig = sign(SECRET, ts, METHOD, URL_PATH);
   const r = verifyStaffHmac({ secret: SECRET, isLocal: false, sig, ts, method: METHOD, reqUrl: URL_PATH, now: NOW });
   assert.strictEqual(r.ok, true);
+});
+
+// ── #3: who actually qualifies for the loopback bypass ──────────
+
+test("#3: a direct loopback caller with no proxy header is local", () => {
+  for (const remoteAddress of ["127.0.0.1", "::1", "::ffff:127.0.0.1"]) {
+    assert.strictEqual(isLocalCaller({ remoteAddress }), true, remoteAddress);
+  }
+});
+
+test("#3: a non-loopback peer is never local", () => {
+  assert.strictEqual(isLocalCaller({ remoteAddress: "203.0.113.9" }), false);
+  assert.strictEqual(isLocalCaller({ remoteAddress: "" }), false);
+});
+
+test("#3 regression: loopback peer + X-Forwarded-For is a proxied remote, not local", () => {
+  // The whole point of the bug: behind same-host nginx every request
+  // arrives from 127.0.0.1. The forwarded-for header is what tells us the
+  // peer is relaying somebody else. Before the fix this returned true and
+  // handed the internet a free pass on restart-radio.
+  assert.strictEqual(
+    isLocalCaller({ remoteAddress: "127.0.0.1", forwardedFor: "203.0.113.9" }),
+    false,
+  );
+  assert.strictEqual(
+    isLocalCaller({ remoteAddress: "::ffff:127.0.0.1", forwardedFor: "203.0.113.9, 10.0.0.1" }),
+    false,
+  );
+});
+
+test("#3: STAFF_REQUIRE_HMAC drops the bypass even for a genuine local caller", () => {
+  assert.strictEqual(isLocalCaller({ remoteAddress: "127.0.0.1", requireHmac: true }), false);
+});
+
+test("#3: a proxied caller is refused by the full gate without a signature", () => {
+  const isLocal = isLocalCaller({ remoteAddress: "127.0.0.1", forwardedFor: "203.0.113.9" });
+  const r = verifyStaffHmac({ secret: SECRET, isLocal, method: METHOD, reqUrl: URL_PATH, now: NOW });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.code, 401);
+});
+
+// ── #9: the dashboard says why its buttons are inert ────────────
+
+test("#9: local caller keeps working action buttons", () => {
+  assert.strictEqual(actionAvailability({ isLocal: true, secret: SECRET }).enabled, true);
+});
+
+test("#9: remote caller with a secret is told a signature is required", () => {
+  const a = actionAvailability({ isLocal: false, secret: SECRET });
+  assert.strictEqual(a.enabled, false);
+  assert.match(a.reason, /HMAC signature/);
+});
+
+test("#9: remote caller with no secret is told remote actions are refused", () => {
+  const a = actionAvailability({ isLocal: false, secret: undefined });
+  assert.strictEqual(a.enabled, false);
+  assert.match(a.reason, /STAFF_SHARED_SECRET/);
 });
