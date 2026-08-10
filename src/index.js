@@ -57,6 +57,24 @@ function parsePort(env, argv) {
 }
 
 /**
+ * Decide whether a caller qualifies for the localhost HMAC bypass (#3).
+ *
+ * The socket peer alone is not enough. Behind a same-host reverse proxy
+ * (the documented staff.ninja-portal.com deployment) *every* request
+ * reaches Node from 127.0.0.1, so a naive loopback check hands the
+ * bypass to the whole internet. A forwarded-for header means the peer
+ * is relaying somebody else — that request is remote no matter what the
+ * socket says. STAFF_REQUIRE_HMAC=true drops the bypass entirely.
+ */
+function isLocalCaller({ remoteAddress, forwardedFor, requireHmac = false }) {
+  if (requireHmac) return false;
+  const loopback =
+    remoteAddress === "127.0.0.1" || remoteAddress === "::1" || remoteAddress === "::ffff:127.0.0.1";
+  if (!loopback) return false;
+  return !forwardedFor;
+}
+
+/**
  * Decide whether a POST /action request is authorized. Localhost is
  * always allowed; remote callers need STAFF_SHARED_SECRET plus a valid
  * HMAC over `${ts}\n${method}\n${reqUrl}` inside the skew window.
@@ -173,6 +191,9 @@ const OBSERVATORY_BASE = process.env.STAFF_OBSERVATORY_BASE || "http://localhost
 const NATS_HOST = process.env.STAFF_NATS_HOST || "swarm.ninja-portal.com";
 const NATS_PORT = parseInt(process.env.STAFF_NATS_PORT || "4222", 10);
 const TRACK_STALL_MS = 12 * 60_000; // 12 min — covers longest tracks + voice-pause overhead
+// Hardening switch: drop the loopback bypass and demand a signed HMAC
+// from every caller, including the local dashboard.
+const REQUIRE_HMAC = (process.env.STAFF_REQUIRE_HMAC || "").toLowerCase() === "true";
 
 // ── State ───────────────────────────────────────────────────
 const state = {
@@ -928,7 +949,26 @@ function recentAlerts(limit = 50) {
   } catch { return []; }
 }
 
-function dashboardHtml() {
+/**
+ * Explain, for the caller actually asking, whether /action/* will accept
+ * an unsigned POST from this page (#9). The dashboard's buttons send a
+ * bare fetch with no signature, so on a proxied deployment they can only
+ * ever 401 — better to render them inert with the reason than to hand
+ * the operator a row of buttons that silently fail.
+ */
+function actionAvailability({ isLocal, secret }) {
+  if (isLocal) return { enabled: true, reason: "" };
+  if (!secret) {
+    return { enabled: false, reason: "remote caller and no STAFF_SHARED_SECRET configured — /action/* refuses every remote request (403)" };
+  }
+  return { enabled: false, reason: "remote caller — /action/* requires an HMAC signature this page cannot produce; use the signed curl recipe below" };
+}
+
+function dashboardHtml(availability = { enabled: true, reason: "" }) {
+  const actionsDisabled = availability.enabled ? "" : " disabled";
+  const actionsBanner = availability.enabled
+    ? ""
+    : `<div style="padding: 10px 12px; margin: 12px 0; border-left: 3px solid #fbbf24; background: rgba(251,191,36,0.06); font-size: 0.8rem; color: var(--dim);"><strong style="color:#fbbf24;">actions unavailable</strong> — ${availability.reason}</div>`;
   return `<!doctype html><html><head>
 <title>kannaka-staff — watcher</title>
 <meta charset="utf-8">
@@ -958,16 +998,19 @@ h1 { font-family: Orbitron, sans-serif; font-size: 1.4rem; color: var(--vio); ma
 .btn:hover { background: rgba(167,139,250,0.25); }
 .btn.warn { border-color: rgba(248,113,113,0.5); color: var(--fail); }
 .btn.warn:hover { background: rgba(248,113,113,0.15); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn:disabled:hover { background: rgba(167,139,250,0.12); }
 </style></head>
 <body>
 <h1>⛩ kannaka-staff — watcher</h1>
 <div class="tag" id="meta">loading…</div>
+${actionsBanner}
 <div class="actions" style="margin: 16px 0; display: flex; gap: 8px; flex-wrap: wrap;">
-  <button onclick="act('trigger-oration')" class="btn">🕊 trigger oration</button>
-  <button onclick="act('trigger-showcase', { album: 'BEND THE ARC' })" class="btn">🎞 BEND THE ARC showcase</button>
-  <button onclick="act('trigger-dream')" class="btn">🌙 dream lite</button>
-  <button onclick="confirmAct('restart-radio')" class="btn warn">↻ restart radio</button>
-  <button onclick="confirmAct('restart-observatory')" class="btn warn">↻ restart observatory</button>
+  <button onclick="act('trigger-oration')" class="btn"${actionsDisabled}>🕊 trigger oration</button>
+  <button onclick="act('trigger-showcase', { album: 'BEND THE ARC' })" class="btn"${actionsDisabled}>🎞 BEND THE ARC showcase</button>
+  <button onclick="act('growth-dream', { mode: 'lite' })" class="btn"${actionsDisabled}>🌙 dream lite</button>
+  <button onclick="confirmAct('restart-radio')" class="btn warn"${actionsDisabled}>↻ restart radio</button>
+  <button onclick="confirmAct('restart-observatory')" class="btn warn"${actionsDisabled}>↻ restart observatory</button>
 </div>
 <div id="actionResult" style="font-size: 0.78rem; color: var(--dim); min-height: 16px; margin-bottom: 12px;"></div>
 <details style="font-size: 0.75rem; color: var(--dim); margin-bottom: 16px;">
@@ -991,16 +1034,16 @@ curl -X POST "https://staff.ninja-portal.com/action/&#36;ACTION" \\
   <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">GROWTH — HRM & DREAM CONSOLIDATION</h3>
   <div id="growth"><div class="empty">loading…</div></div>
   <div style="margin-top: 8px; display: flex; gap: 8px;">
-    <button onclick="act('growth-dream', { mode: 'lite' })" class="btn">🌙 dream lite (tracked)</button>
-    <button onclick="confirmAct('growth-dream', { mode: 'deep' })" class="btn warn">🌙🌙 dream deep</button>
+    <button onclick="act('growth-dream', { mode: 'lite' })" class="btn"${actionsDisabled}>🌙 dream lite (tracked)</button>
+    <button onclick="confirmAct('growth-dream', { mode: 'deep' })" class="btn warn"${actionsDisabled}>🌙🌙 dream deep</button>
   </div>
 </div>
 <div class="alerts">
   <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">CURATOR — ALBUM STALENESS</h3>
   <div id="staleness"><div class="empty">loading…</div></div>
   <div style="margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap;">
-    <button onclick="confirmAct('curator-rescue')" class="btn">🚒 rescue oldest-starving (cooldown 24h)</button>
-    <button onclick="confirmAct('curator-rescue', { force: '1' })" class="btn warn">🚒 force rescue (skip cooldown)</button>
+    <button onclick="confirmAct('curator-rescue')" class="btn"${actionsDisabled}>🚒 rescue oldest-starving (cooldown 24h)</button>
+    <button onclick="confirmAct('curator-rescue', { force: '1' })" class="btn warn"${actionsDisabled}>🚒 force rescue (skip cooldown)</button>
   </div>
 </div>
 <div class="alerts">
@@ -1011,7 +1054,7 @@ curl -X POST "https://staff.ninja-portal.com/action/&#36;ACTION" \\
   <h3 style="color: var(--vio); font-size: 0.95rem; letter-spacing: 0.1em;">CREATOR — GENERATION QUEUE</h3>
   <div id="creator"><div class="empty">loading…</div></div>
   <div style="margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap;">
-    <button onclick="act('creator-request', { kind: 'oration' })" class="btn">🕊 generate oration</button>
+    <button onclick="act('creator-request', { kind: 'oration' })" class="btn"${actionsDisabled}>🕊 generate oration</button>
   </div>
 </div>
 <div class="alerts">
@@ -1248,8 +1291,13 @@ function confirmAct(action, params) {
 
 const server = http.createServer((req, res) => {
   if (req.url === "/" || req.url === "/index.html") {
+    const isLocal = isLocalCaller({
+      remoteAddress: req.socket.remoteAddress || "",
+      forwardedFor: req.headers["x-forwarded-for"],
+      requireHmac: REQUIRE_HMAC,
+    });
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(dashboardHtml());
+    res.end(dashboardHtml(actionAvailability({ isLocal, secret: process.env.STAFF_SHARED_SECRET })));
     return;
   }
   if (req.url === "/api/state") {
@@ -1345,8 +1393,11 @@ const server = http.createServer((req, res) => {
     // Auth check. Localhost always allowed (the dashboard's quick-action
     // buttons + local SSH-tunnel ops). Remote callers must HMAC-sign.
     const secret = process.env.STAFF_SHARED_SECRET;
-    const remote = req.socket.remoteAddress || "";
-    const isLocal = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+    const isLocal = isLocalCaller({
+      remoteAddress: req.socket.remoteAddress || "",
+      forwardedFor: req.headers["x-forwarded-for"],
+      requireHmac: REQUIRE_HMAC,
+    });
     // Reject stale timestamps to prevent replay (5 min window). Localhost
     // bypasses; remote callers must present a valid HMAC (verifyStaffHmac).
     const auth = verifyStaffHmac({
@@ -1386,6 +1437,8 @@ const server = http.createServer((req, res) => {
 // require.main === module, so production boot is unaffected.
 module.exports = {
   parsePort,
+  isLocalCaller,
+  actionAvailability,
   verifyStaffHmac,
   cooldownRemainingMs,
   computeEffectiveOk,
