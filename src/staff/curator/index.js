@@ -131,6 +131,92 @@ async function fetchStaleness(radioBase, historyLimit) {
   return { ok: true, albums, historyLen: hist.length };
 }
 
+// ── Pure classification/alert-edge logic (exported for tests) ──
+
+function classifyAge(album, cfg) {
+  if (album.ageMs == null) return "never";
+  if (album.ageMs >= cfg.starvingMs) return "starving";
+  if (album.ageMs >= cfg.agingMs) return "aging";
+  return "fresh";
+}
+
+/**
+ * One tick's worth of album evaluation. Returns the alerts to emit and
+ * the updated state maps, without touching disk or the bus.
+ *
+ * Two things are load-bearing here:
+ *
+ *  - `everPlayed` is a ledger of every play ever observed. /api/history
+ *    is a bounded window, so an album that simply hasn't played lately
+ *    falls out of it and would otherwise look identical to one that has
+ *    never played at all.
+ *  - alert edges compare against `alerted`, not `classification`. The
+ *    warmup guard suppresses writes while the history window is too
+ *    short to mean anything; updating the compared-against state during
+ *    that window consumed the edge permanently.
+ */
+function evaluateAlbums({ cfg, albums, historyLen, classification = {}, alerted = {}, everPlayed = {}, now = Date.now() }) {
+  const alertsActive = historyLen >= cfg.minHistoryForAlerts;
+  const nextClassification = { ...classification };
+  const nextAlerted = { ...alerted };
+  const nextEverPlayed = { ...everPlayed };
+  const alerts = [];
+
+  for (const raw of albums) {
+    const album = { ...raw };
+    if (album.lastPlayed) {
+      nextEverPlayed[album.album] = Math.max(album.lastPlayed, nextEverPlayed[album.album] || 0);
+    } else if (nextEverPlayed[album.album]) {
+      album.lastPlayed = nextEverPlayed[album.album];
+      album.ageMs = now - album.lastPlayed;
+      album.agedOut = true;
+    }
+
+    const next = classifyAge(album, cfg);
+    nextClassification[album.album] = next; // display state is always current
+
+    const prev = nextAlerted[album.album];
+    if (next === prev) continue;
+    if (!alertsActive) continue; // edge preserved for a later, meaningful tick
+
+    if (next === "starving") {
+      const hrs = Math.round(album.ageMs / 3600000);
+      const where = album.agedOut
+        ? ` (aged out of the last ${historyLen} tracks)`
+        : ` (plays in window: ${album.playsInWindow})`;
+      alerts.push({
+        transition: "CURATOR_ALBUM_STARVING",
+        message: `"${album.album}" — ${hrs}h since last play${where}`,
+        subject: "KANNAKA.staff.album.starving",
+        payload: { album: album.album, ageMs: album.ageMs, playsInWindow: album.playsInWindow },
+      });
+    } else if (next === "never" && prev !== "never") {
+      alerts.push({
+        transition: "CURATOR_ALBUM_NEVER_PLAYED",
+        message: `"${album.album}" registered but never observed playing — check that files exist`,
+        subject: "KANNAKA.staff.album.never_played",
+        payload: { album: album.album, historyLen },
+      });
+    } else if (prev === "starving" && next !== "starving") {
+      alerts.push({
+        transition: "CURATOR_ALBUM_REFRESHED",
+        message: `"${album.album}" back in rotation`,
+        subject: "KANNAKA.staff.album.refreshed",
+        payload: { album: album.album },
+      });
+    }
+    nextAlerted[album.album] = next;
+  }
+
+  return {
+    alertsActive,
+    alerts,
+    classification: nextClassification,
+    alerted: nextAlerted,
+    everPlayed: nextEverPlayed,
+  };
+}
+
 function bootCurator(deps) {
   const RADIO_BASE = deps.radioBase;
   const ALERTS_FILE = deps.alertsFile;
@@ -157,7 +243,9 @@ function bootCurator(deps) {
     bootedAt: Date.now(),
     lastTick: null,
     lastSnapshot: null,
-    classification: {},  // {album: "fresh|aging|starving|never"}
+    classification: {},  // {album: "fresh|aging|starving|never"} — display
+    alerted: {},         // {album: last classification we actually alerted on}
+    everPlayed: {},      // {album: newest playedAt we have ever observed}
   };
 
   try {
@@ -165,6 +253,10 @@ function bootCurator(deps) {
       const persisted = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
       if (persisted && typeof persisted === "object" && persisted.classification) {
         c.classification = persisted.classification;
+        // Older state files predate the alerted/everPlayed split; seeding
+        // alerted from classification keeps their edges from re-firing.
+        c.alerted = persisted.alerted || { ...persisted.classification };
+        c.everPlayed = persisted.everPlayed || {};
       }
     }
   } catch (e) {
@@ -173,7 +265,11 @@ function bootCurator(deps) {
 
   function persist() {
     try {
-      fs.writeFileSync(STATE_FILE, JSON.stringify({ classification: c.classification }, null, 2));
+      fs.writeFileSync(STATE_FILE, JSON.stringify({
+        classification: c.classification,
+        alerted: c.alerted,
+        everPlayed: c.everPlayed,
+      }, null, 2));
     } catch (e) {
       console.warn(`[curator] state save: ${e.message}`);
     }
@@ -194,12 +290,7 @@ function bootCurator(deps) {
     console.log(`[curator] ${transition}: ${message}`);
   }
 
-  function classify(album) {
-    if (album.ageMs == null) return "never";
-    if (album.ageMs >= cfg.starvingMs) return "starving";
-    if (album.ageMs >= cfg.agingMs) return "aging";
-    return "fresh";
-  }
+  const classify = (album) => classifyAge(album, cfg);
 
   async function tick() {
     if (!cfg.enabled) return;
@@ -214,29 +305,22 @@ function bootCurator(deps) {
     // history window to actually mean something. Classification still
     // updates so the dashboard reflects current state; only the
     // alerts.jsonl writes wait for signal-over-noise.
-    const alertsActive = snap.historyLen >= cfg.minHistoryForAlerts;
-    for (const album of snap.albums) {
-      const next = classify(album);
-      const prev = c.classification[album.album];
-      if (next === prev) continue;
-      // Transitions worth alerting on. We don't fire on every reclassify —
-      // only on the two big shifts the operator actually cares about:
-      // entering starving (or never-played), and leaving starving.
-      if (alertsActive) {
-        if (next === "starving") {
-          const hrs = Math.round(album.ageMs / 3600000);
-          logAlert("CURATOR_ALBUM_STARVING", `"${album.album}" — ${hrs}h since last play (plays in window: ${album.playsInWindow})`);
-          publish("KANNAKA.staff.album.starving", { album: album.album, ageMs: album.ageMs, playsInWindow: album.playsInWindow });
-        } else if (next === "never" && prev !== "never") {
-          logAlert("CURATOR_ALBUM_NEVER_PLAYED", `"${album.album}" registered but absent from last ${snap.historyLen} tracks — check that files exist`);
-          publish("KANNAKA.staff.album.never_played", { album: album.album, historyLen: snap.historyLen });
-        } else if (prev === "starving" && next !== "starving") {
-          logAlert("CURATOR_ALBUM_REFRESHED", `"${album.album}" back in rotation`);
-          publish("KANNAKA.staff.album.refreshed", { album: album.album });
-        }
-      }
-      c.classification[album.album] = next;
+    const r = evaluateAlbums({
+      cfg,
+      albums: snap.albums,
+      historyLen: snap.historyLen,
+      classification: c.classification,
+      alerted: c.alerted,
+      everPlayed: c.everPlayed,
+    });
+    for (const a of r.alerts) {
+      logAlert(a.transition, a.message);
+      publish(a.subject, a.payload);
     }
+    c.classification = r.classification;
+    c.alerted = r.alerted;
+    c.everPlayed = r.everPlayed;
+    const alertsActive = r.alertsActive;
     if (!alertsActive && Object.keys(c.classification).length > 0 && snap.historyLen === 0) {
       // First-tick after a fresh restart: print one info line so the
       // operator knows Curator is alive but silent on purpose.
@@ -277,4 +361,4 @@ function bootCurator(deps) {
   };
 }
 
-module.exports = { bootCurator };
+module.exports = { bootCurator, evaluateAlbums, classifyAge };
