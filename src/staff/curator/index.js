@@ -45,6 +45,8 @@ const https = require("https");
 const path = require("path");
 const url = require("url");
 
+const { readEnvMs } = require("../util");
+
 const DEFAULTS = {
   TICK_MS: 30 * 60 * 1000,            // 30 min
   STARVING_MS: 48 * 60 * 60 * 1000,   // 48 h
@@ -57,11 +59,6 @@ const DEFAULTS = {
   // album (saw 23/23 fire on 2026-05-12).
   MIN_HISTORY_FOR_ALERTS: 30,
 };
-
-function readEnvMs(name, fallback) {
-  const v = parseInt(process.env[name] || "", 10);
-  return Number.isFinite(v) && v > 0 ? v : fallback;
-}
 
 function probeHttpJson(target, timeoutMs = 5000, maxBody = 200 * 1024) {
   return new Promise((resolve) => {

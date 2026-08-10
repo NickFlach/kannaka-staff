@@ -54,6 +54,8 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 
+const { readEnvMs } = require("../util");
+
 const DEFAULTS = {
   JOB_TIMEOUT_MS: 60 * 60 * 1000,    // 60 min
   HISTORY_MAX: 12,
@@ -64,10 +66,6 @@ const DEFAULTS = {
 function readEnvStr(name, fallback) {
   const v = (process.env[name] || "").trim();
   return v || fallback;
-}
-function readEnvMs(name, fallback) {
-  const v = parseInt(process.env[name] || "", 10);
-  return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
 function bootDistributor(deps) {
