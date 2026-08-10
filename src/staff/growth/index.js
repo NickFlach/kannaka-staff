@@ -195,6 +195,15 @@ function decideDream({ cfg, sample, lastDream, inFlight, now = Date.now() }) {
 function bootGrowth(deps) {
   const HRM_PATH = deps.hrmPath;
   const ALERTS_FILE = deps.alertsFile;
+  const bus = deps.staffBus || null;
+
+  // ADR-003 § subjects. Growth was handed the bus at boot but never
+  // published, so every dream and bloat episode was invisible to the
+  // rest of the crew and to the dashboard's bus panel.
+  function publish(subject, payload) {
+    if (!bus) return;
+    bus.emit(subject, { ts: Date.now(), source: "growth", subject, payload });
+  }
   const KANNAKA_BIN = readEnvStr("KANNAKA_BIN", "/home/opc/kannaka-memory/target/release/kannaka");
   const STATE_FILE = path.join(path.dirname(ALERTS_FILE), "growth-state.json");
   const STATUS_CACHE_PATH = statusCachePathFor(HRM_PATH);
@@ -301,6 +310,7 @@ function bootGrowth(deps) {
     const before = sampleHrm();
     const startedAt = Date.now();
     logAlert("GROWTH_DREAM_START", `${mode} — ${reason} — HRM=${before.sizeMB != null ? before.sizeMB.toFixed(1) + "MB" : "?"}`);
+    publish("KANNAKA.staff.dream.start", { mode, reason, sizeMB: before.sizeMB, memoryCount: before.memoryCount });
 
     const child = exec(
       `${KANNAKA_BIN} dream --mode ${mode}`,
@@ -321,6 +331,9 @@ function bootGrowth(deps) {
         if (g.dreamHistory.length > DEFAULTS.DREAM_HISTORY_MAX) g.dreamHistory.shift();
         g.inFlight = null;
         logAlert(ok ? "GROWTH_DREAM_DONE" : "GROWTH_DREAM_FAILED", message);
+        publish(ok ? "KANNAKA.staff.dream.done" : "KANNAKA.staff.dream.failed", {
+          mode, reason, durationMs, message, before, after,
+        });
         persist();
       }
     );
@@ -338,6 +351,14 @@ function bootGrowth(deps) {
     if (bloat) {
       logAlert(bloat.transition, bloat.message);
       g.bloatedAlerted = bloat.bloatedAlerted;
+      // ADR-003 § subjects — the bloat/recovery edges belong on the bus
+      // too, not just in alerts.jsonl.
+      publish(
+        bloat.transition === "GROWTH_HRM_BLOATED"
+          ? "KANNAKA.staff.hrm.bloated"
+          : "KANNAKA.staff.hrm.recovered",
+        { message: bloat.message, sizeMB: sample.sizeMB, memoryCount: sample.memoryCount },
+      );
     }
     return decision;
   }
