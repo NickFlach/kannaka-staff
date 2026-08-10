@@ -75,6 +75,14 @@ function bootCreator(deps) {
   const ALERTS_FILE = deps.alertsFile;
   const RADIO_BASE = deps.radioBase;
   const STATE_FILE = path.join(path.dirname(ALERTS_FILE), "creator-state.json");
+  const bus = deps.staffBus || null;
+
+  // ADR-003 § subjects. The bus was passed in at boot but never used, so
+  // generation jobs never appeared on the bus or the dashboard's panel.
+  function publish(subject, payload) {
+    if (!bus) return;
+    bus.emit(subject, { ts: Date.now(), source: "creator", subject, payload });
+  }
 
   const cfg = {
     radioBase: RADIO_BASE,
@@ -179,6 +187,7 @@ function bootCreator(deps) {
     const startedAt = Date.now();
     c.current = { id, kind, startedAt, query };
     logAlert("CREATOR_JOB_START", `${id} kind=${kind}`);
+    publish("KANNAKA.staff.creator.job.start", { id, kind });
     dispatch(kind, query)
       .then((r) => {
         const finishedAt = Date.now();
@@ -189,6 +198,9 @@ function bootCreator(deps) {
         if (c.history.length > DEFAULTS.HISTORY_MAX) c.history.shift();
         c.current = null;
         logAlert(ok ? "CREATOR_JOB_DONE" : "CREATOR_JOB_FAILED", message);
+        publish(ok ? "KANNAKA.staff.creator.job.done" : "KANNAKA.staff.creator.job.failed", {
+          id, kind, status: r.status, message,
+        });
         persist();
       })
       .catch((e) => {
@@ -198,6 +210,7 @@ function bootCreator(deps) {
         if (c.history.length > DEFAULTS.HISTORY_MAX) c.history.shift();
         c.current = null;
         logAlert("CREATOR_JOB_FAILED", message);
+        publish("KANNAKA.staff.creator.job.failed", { id, kind, status: 0, message });
         persist();
       });
     return { ok: true, jobId: id, kind };

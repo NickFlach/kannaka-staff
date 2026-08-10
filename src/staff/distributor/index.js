@@ -80,6 +80,14 @@ function readEnvStr(name, fallback) {
 function bootDistributor(deps) {
   const ALERTS_FILE = deps.alertsFile;
   const STATE_FILE = path.join(path.dirname(ALERTS_FILE), "distributor-state.json");
+  const bus = deps.staffBus || null;
+
+  // ADR-003 § subjects. The bus was passed in at boot but never used, so
+  // publish jobs never appeared on the bus or the dashboard's bus panel.
+  function publish(subject, payload) {
+    if (!bus) return;
+    bus.emit(subject, { ts: Date.now(), source: "distributor", subject, payload });
+  }
 
   const cfg = {
     jobTimeoutMs: readEnvMs("DISTRIBUTOR_JOB_TIMEOUT_MS", DEFAULTS.JOB_TIMEOUT_MS),
@@ -169,6 +177,7 @@ function bootDistributor(deps) {
     d.current = job;
 
     logAlert("DISTRIBUTOR_JOB_START", `${id} "${name}" — ${configPath}${skip ? ` (skip=${skip})` : ""}`);
+    publish("KANNAKA.staff.distributor.job.start", { id, name, configPath, skip });
 
     const onChunk = (buf) => {
       const lines = buf.toString("utf8").split("\n").filter(Boolean);
@@ -205,6 +214,9 @@ function bootDistributor(deps) {
       if (d.history.length > DEFAULTS.HISTORY_MAX) d.history.shift();
       d.current = null;
       logAlert(ok ? "DISTRIBUTOR_JOB_DONE" : "DISTRIBUTOR_JOB_FAILED", message);
+      publish(ok ? "KANNAKA.staff.distributor.job.done" : "KANNAKA.staff.distributor.job.failed", {
+        id, name, configPath, exitCode: code, signal: signal || null, message,
+      });
       persist();
     });
 
@@ -221,6 +233,7 @@ function bootDistributor(deps) {
       d.current = null;
       try { clearTimeout(job.timeoutHandle); } catch (_) {}
       logAlert("DISTRIBUTOR_JOB_FAILED", message);
+      publish("KANNAKA.staff.distributor.job.failed", { id, name, configPath, error: err.message, message });
       persist();
     });
 

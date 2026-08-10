@@ -40,6 +40,14 @@ function readEnvStr(name, fallback) {
 function bootMarketer(deps) {
   const ALERTS_FILE = deps.alertsFile;
   const STATE_FILE = path.join(path.dirname(ALERTS_FILE), "marketer-state.json");
+  const bus = deps.staffBus || null;
+
+  // ADR-003 § subjects. The bus was passed in at boot but never used, so
+  // social fan-outs never appeared on the bus or the dashboard's panel.
+  function publish(subject, payload) {
+    if (!bus) return;
+    bus.emit(subject, { ts: Date.now(), source: "marketer", subject, payload });
+  }
 
   const cfg = {
     // Falls back to a sibling kannaka-radio checkout before the Oracle
@@ -122,6 +130,9 @@ function bootMarketer(deps) {
     m.history.push(record);
     if (m.history.length > DEFAULTS.HISTORY_MAX) m.history.shift();
     logAlert(anyOk ? "MARKETER_POST_DONE" : "MARKETER_POST_FAILED", `${id} · ${summary}`);
+    publish(anyOk ? "KANNAKA.staff.marketer.post.done" : "KANNAKA.staff.marketer.post.failed", {
+      id, okCount, totalCount, summary, link,
+    });
     persist();
     return { ok: anyOk, jobId: id, okCount, totalCount, summary };
   }

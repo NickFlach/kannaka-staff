@@ -929,10 +929,30 @@ async function handleAction(action, query) {
       return { ok: r.ok, album, duration, status: r.status, body: r.body };
     }
     case "trigger-dream": {
-      // Legacy fire-and-forget. Prefer "growth-dream" so the
-      // result lands in growth-state.json + alerts.jsonl.
-      exec("/home/opc/kannaka-memory/target/release/kannaka dream --mode lite", { timeout: 900_000 }, () => {});
-      return { ok: true, kind: "dream", note: "spawned in background; watch hrm_size + observatory_serving probes" };
+      // Legacy alias. It used to exec a hardcoded binary path and report
+      // ok:true unconditionally — including when the binary did not exist
+      // — so the operator was told a dream had launched when nothing had.
+      // It now delegates to Growth, which owns the configurable binary,
+      // the in-flight guard, and the alerts.jsonl trail.
+      if (growth) {
+        const r = growth.requestDream("lite", "legacy trigger-dream action");
+        return { ...r, kind: "dream", note: "delegated to Growth — see /api/growth and alerts.jsonl" };
+      }
+      // No Growth on this host (no local HRM): report the launch honestly
+      // instead of claiming success for a spawn we never confirmed.
+      return await new Promise((resolve) => {
+        const bin = process.env.KANNAKA_BIN || "/home/opc/kannaka-memory/target/release/kannaka";
+        if (!fs.existsSync(bin)) {
+          resolve({ ok: false, kind: "dream", error: `kannaka binary not found at ${bin} (set KANNAKA_BIN)` });
+          return;
+        }
+        const child = exec(`${bin} dream --mode lite`, { timeout: 900_000 }, () => {});
+        child.on("error", (e) => resolve({ ok: false, kind: "dream", error: `spawn failed: ${e.message}` }));
+        child.on("spawn", () => resolve({
+          ok: true, kind: "dream", pid: child.pid,
+          note: "spawned in background; watch hrm_size + observatory_serving probes",
+        }));
+      });
     }
     case "growth-dream": {
       // Route through Growth so the dream is tracked (in-flight guard,
@@ -1620,6 +1640,7 @@ function runAutoRecoverRestart(reason) {
     console.log(`[auto-recover] ${reason} — cooldown active (${Math.round(remaining / 60000)}m remaining)`);
     return;
   }
+  const prevRestartTs = AUTO_RECOVER.lastRestartTs;
   AUTO_RECOVER.lastRestartTs = Date.now();
   const entry = {
     ts: new Date().toISOString(),
@@ -1629,12 +1650,29 @@ function runAutoRecoverRestart(reason) {
   };
   try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(entry) + "\n"); } catch (_) {}
   console.log(`[auto-recover] AUTO_RECOVER_RESTART: ${entry.message}`);
+  // ADR-003 documents this subject; it was never actually published, so
+  // nothing downstream could observe that an auto-restart had fired.
+  staffBus.emit("KANNAKA.staff.action.auto_recover.restart", {
+    ts: Date.now(),
+    source: "auto-recover",
+    subject: "KANNAKA.staff.action.auto_recover.restart",
+    payload: { reason },
+  });
   execFile("sudo", ["/bin/systemctl", "restart", "kannaka-radio"], { timeout: 30_000 }, (err, _out, errOut) => {
+    if (err) {
+      // The restart never happened, so it must not consume the window.
+      // Both triggers are edge-triggered (Ear and Voice each alert once
+      // per episode), so releasing the cooldown cannot cause a restart
+      // storm — it just lets the next genuine trigger try again.
+      AUTO_RECOVER.lastRestartTs = prevRestartTs;
+    }
     const done = {
       ts: new Date().toISOString(),
       probe: "auto-recover",
       transition: err ? "AUTO_RECOVER_FAILED" : "AUTO_RECOVER_DONE",
-      message: err ? `restart failed: ${err.message} ${(errOut || "").slice(0, 200)}` : "kannaka-radio restart completed",
+      message: err
+        ? `restart failed: ${err.message} ${(errOut || "").slice(0, 200)} — cooldown released for retry`
+        : "kannaka-radio restart completed",
     };
     try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(done) + "\n"); } catch (_) {}
     console.log(`[auto-recover] ${done.transition}: ${done.message}`);
@@ -1678,7 +1716,23 @@ async function fireRescue(reason) {
   const starving = curator.starvingAlbums();
   if (starving.length === 0) return { ok: false, error: "no starving albums to rescue" };
   const target = starving[0];
+  const prevRescueTs = AUTO_RESCUE.lastRescueTs;
   AUTO_RESCUE.lastRescueTs = Date.now();
+  const staleHrs = Math.round((target.ageMs || 0) / 3600000);
+  // A rescue that never reached the radio must not consume the 24h slot,
+  // and must not be invisible. Both the transport-error path and a
+  // non-2xx response now roll the stamp back AND write to alerts.jsonl.
+  const rescueFailed = (detail) => {
+    AUTO_RESCUE.lastRescueTs = prevRescueTs;
+    const entry = {
+      ts: new Date().toISOString(),
+      probe: "auto-rescue",
+      transition: "AUTO_RESCUE_FAILED",
+      message: `"${target.album}" — ${staleHrs}h stale — showcase ${AUTO_RESCUE.durationMin}min (${reason}) — ${detail} — cooldown released for retry`,
+    };
+    try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(entry) + "\n"); } catch (_) {}
+    console.log(`[auto-rescue] AUTO_RESCUE_FAILED: ${entry.message}`);
+  };
   const u = `${RADIO_BASE}/api/album/showcase?album=${encodeURIComponent(target.album)}&duration=${AUTO_RESCUE.durationMin}`;
   return new Promise((resolve) => {
     const uu = url.parse(u);
@@ -1687,7 +1741,8 @@ async function fireRescue(reason) {
     const req = lib.request({
       method: "POST",
       hostname: uu.hostname,
-      port: uu.port || 80,
+      // An https RADIO_BASE with no explicit port was dialled on 80.
+      port: uu.port || (uu.protocol === "https:" ? 443 : 80),
       path: uu.pathname + (uu.search || ""),
       timeout: 10_000,
     }, (res) => {
@@ -1697,11 +1752,16 @@ async function fireRescue(reason) {
         if (settled) return;
         settled = true;
         const ok = res.statusCode >= 200 && res.statusCode < 400;
+        if (!ok) {
+          rescueFailed(`HTTP ${res.statusCode}`);
+          resolve({ ok: false, album: target.album, status: res.statusCode });
+          return;
+        }
         const entry = {
           ts: new Date().toISOString(),
           probe: "auto-rescue",
-          transition: ok ? "AUTO_RESCUE_FIRED" : "AUTO_RESCUE_FAILED",
-          message: `"${target.album}" — ${Math.round((target.ageMs || 0) / 3600000)}h stale — showcase ${AUTO_RESCUE.durationMin}min (${reason}) — HTTP ${res.statusCode}`,
+          transition: "AUTO_RESCUE_FIRED",
+          message: `"${target.album}" — ${staleHrs}h stale — showcase ${AUTO_RESCUE.durationMin}min (${reason}) — HTTP ${res.statusCode}`,
         };
         try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(entry) + "\n"); } catch (_) {}
         console.log(`[auto-rescue] ${entry.transition}: ${entry.message}`);
@@ -1713,10 +1773,7 @@ async function fireRescue(reason) {
     req.on("error", (e) => {
       if (settled) return;
       settled = true;
-      // roll back the rate-limit stamp on transport failure so the next
-      // tick can retry — we don't want a network blip to consume the
-      // 24h slot.
-      AUTO_RESCUE.lastRescueTs = sinceLast > 0 ? AUTO_RESCUE.lastRescueTs - AUTO_RESCUE.cooldownMs : 0;
+      rescueFailed(`transport error: ${e.message}`);
       resolve({ ok: false, error: e.message });
     });
     req.on("timeout", () => req.destroy(new Error("timeout")));
