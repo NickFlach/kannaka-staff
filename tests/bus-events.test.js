@@ -45,14 +45,18 @@ function waitFor(bus, subject, ms = 5000) {
 test("#41 regression: Creator publishes job.start and job.failed", async () => {
   const { bus, seen } = recordingBus();
   const creator = bootCreator({
-    radioBase: "http://127.0.0.1:1",
+    radioBase: "http://127.0.0.1:1", // nothing listening — dispatch fails fast
     alertsFile: tmpAlerts("creator-bus-"),
     staffBus: bus,
   });
-  // kind=track is refused synchronously inside dispatch, so this settles
-  // without touching the network.
+  // kind=oration is the accepted-then-fails-asynchronously case. It has no
+  // up-front preconditions (#67 deliberately does not pre-judge it, since
+  // its failure mode is a live HTTP call), so requestCreate returns ok:true
+  // and the job only fails once the connection to the dead port is refused.
+  // This used to use kind=track, which #67 now — correctly — refuses
+  // synchronously, so it no longer reaches the bus at all.
   const done = waitFor(bus, "KANNAKA.staff.creator.job.failed");
-  const r = creator.requestCreate({ kind: "track" });
+  const r = creator.requestCreate({ kind: "oration" });
   assert.strictEqual(r.ok, true, "the job is accepted, then fails in dispatch");
   await done;
 
@@ -64,7 +68,22 @@ test("#41 regression: Creator publishes job.start and job.failed", async () => {
   const start = seen.find((s) => s.subject === "KANNAKA.staff.creator.job.start");
   assert.strictEqual(start.event.source, "creator");
   assert.strictEqual(typeof start.event.ts, "number");
-  assert.strictEqual(start.event.payload.kind, "track");
+  assert.strictEqual(start.event.payload.kind, "oration");
+});
+
+test("#67 + #41: a synchronously-refused kind never reaches the bus at all", () => {
+  // The complement of the test above, and the interaction that broke master
+  // when #83 and #85 merged in sequence: a job refused up front must not
+  // emit job.start, because no job was ever started.
+  const { bus, seen } = recordingBus();
+  const creator = bootCreator({
+    radioBase: "http://127.0.0.1:1",
+    alertsFile: tmpAlerts("creator-bus-sync-"),
+    staffBus: bus,
+  });
+  const r = creator.requestCreate({ kind: "track" });
+  assert.strictEqual(r.ok, false);
+  assert.deepStrictEqual(seen.map((s) => s.subject), [], "no bus traffic for a refused request");
 });
 
 test("#41 regression: Distributor publishes job.start", () => {
