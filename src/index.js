@@ -1160,9 +1160,12 @@ async function refresh() {
         const ov = s.override
           ? '<div class="alert" style="border-left-color: var(--vio); background: rgba(167,139,250,0.06);"><strong>override active:</strong> ' + s.override.album + (s.override.untilHuman ? ' (until ' + s.override.untilHuman + ')' : '') + '</div>'
           : '';
-        const next = s.nextShowcase && s.nextShowcase.inMinutes != null
-          ? '<div class="alert" style="border-left-color: var(--ok);"><strong>next showcase:</strong> in ' + Math.floor(s.nextShowcase.inMinutes / 60) + 'h ' + (s.nextShowcase.inMinutes % 60) + 'm (' + s.nextShowcase.fixedSchedule + ')</div>'
-          : '';
+        const ns = s.nextShowcase;
+        const next = !ns || ns.inMinutes == null
+          ? ''
+          : ns.inProgress
+            ? '<div class="alert" style="border-left-color: var(--vio); background: rgba(167,139,250,0.06);"><strong>showcase window ACTIVE now</strong> (' + ns.fixedSchedule + ')</div>'
+            : '<div class="alert" style="border-left-color: var(--ok);"><strong>next showcase:</strong> in ' + Math.floor(ns.inMinutes / 60) + 'h ' + (ns.inMinutes % 60) + 'm (' + ns.fixedSchedule + ')</div>';
         const cur = '<div class="alert" style="border-left-color: var(--dim); background: transparent;"><strong>now:</strong> ' + (s.currentAlbum || '?') + (s.block ? ' · block: ' + s.block : '') + '</div>';
         return cur + ov + next;
       }),
