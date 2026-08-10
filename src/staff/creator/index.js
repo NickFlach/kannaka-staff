@@ -111,8 +111,14 @@ function bootCreator(deps) {
     console.log(`[creator] ${transition}: ${message}`);
   }
 
+  // The rest of the constellation passes the OBC token in the
+  // environment; requiring the credentials file made image jobs fail with
+  // "no OBC JWT" on any host that had a perfectly good OPENBOTCITY_JWT.
+  // Env wins, file is the fallback.
   function readObcJwt() {
-    try { return JSON.parse(fs.readFileSync(cfg.obcJwtFile, "utf8")).jwt; }
+    const fromEnv = (process.env.OPENBOTCITY_JWT || process.env.OBC_JWT || "").trim();
+    if (fromEnv) return fromEnv;
+    try { return JSON.parse(fs.readFileSync(cfg.obcJwtFile, "utf8")).jwt || ""; }
     catch (_) { return ""; }
   }
 
