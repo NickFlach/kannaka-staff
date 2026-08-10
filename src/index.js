@@ -124,6 +124,30 @@ function transitionFor(prevEffectiveOk, effectiveOk) {
   return effectiveOk ? "RECOVERED" : "FAILED";
 }
 
+/**
+ * Turn an OBC /health response into a probe verdict (#50).
+ *
+ * The endpoint answers `{status:"ok", service:"openbotcity-api", timestamp}`.
+ * We check the body rather than the status code, because a 200 from a
+ * proxy or an error page says nothing about the service behind it — that
+ * imprecision is what made the old obc_reachable probe green on 401.
+ */
+function obcHealthVerdict(r, expectService = "openbotcity-api") {
+  if (!r.ok) return { ok: false, message: `HTTP ${r.status || 0} ${r.error || ""}`.trim() };
+  let j;
+  try { j = JSON.parse(r.body); } catch (_) {
+    return { ok: false, message: `HTTP ${r.status} but body is not JSON` };
+  }
+  const status = j && typeof j.status === "string" ? j.status.toLowerCase() : null;
+  if (status !== "ok") {
+    return { ok: false, message: `service reports status=${j && j.status !== undefined ? JSON.stringify(j.status) : "(absent)"}` };
+  }
+  if (expectService && j.service !== expectService) {
+    return { ok: false, message: `unexpected service=${JSON.stringify(j.service ?? null)} (want ${expectService})` };
+  }
+  return { ok: true, message: `${j.service} status=ok` };
+}
+
 /** Build a busRing entry for a KANNAKA.* event, or null to skip (ADR-003). */
 function summarizeBusEvent(subject, event) {
   if (typeof subject !== "string" || !subject.startsWith("KANNAKA.")) return null;
@@ -213,6 +237,7 @@ const TRACK_STALL_MS = 12 * 60_000; // 12 min — covers longest tracks + voice-
 // Hardening switch: drop the loopback bypass and demand a signed HMAC
 // from every caller, including the local dashboard.
 const REQUIRE_HMAC = (process.env.STAFF_REQUIRE_HMAC || "").toLowerCase() === "true";
+const OBC_HEALTH_URL = process.env.STAFF_OBC_HEALTH_URL || "https://api.openbotcity.com/health";
 
 // ── State ───────────────────────────────────────────────────
 const state = {
@@ -725,15 +750,22 @@ async function runAllProbes() {
     }
   }
 
-  // 11. obc_reachable — POST hits the OpenBotCity heartbeat endpoint.
-  // GET works too but heartbeat is the canonical liveness check.
+  // 11. obc_healthy — OpenBotCity's read-only health endpoint.
+  //
+  // This used to hit /world/heartbeat and count 401/403 as alive, which
+  // meant the probe went green on any auth-gated response — including one
+  // served by a front door whose backend is dead. It also claimed in a
+  // comment to POST, while sending GET; POST /world/heartbeat is a 404 and
+  // has no canonical heartbeat behind it.
+  //
+  // GET /health is unauthenticated, side-effect free, and reports the
+  // service's own verdict, so we assert the payload rather than an HTTP
+  // code. Narrower claim than "our identity can authenticate" — but a
+  // true one. See #50.
   {
-    const r = await probeHttp("https://api.openbotcity.com/world/heartbeat", { method: "GET", timeout: 8000 });
-    results.obc_reachable = {
-      ok: r.ok || r.status === 401 || r.status === 403, // auth-required is still "alive"
-      message: `HTTP ${r.status || 0} ${r.error || ""}`,
-      ts,
-    };
+    const r = await probeHttp(OBC_HEALTH_URL, { method: "GET", timeout: 8000, maxBody: 4096 });
+    const v = obcHealthVerdict(r);
+    results.obc_healthy = { ok: v.ok, message: v.message, ts };
   }
 
   // 12. disk_space — local df. In external mode this reports the OBSERVER's
@@ -1512,6 +1544,7 @@ module.exports = {
   computeEffectiveOk,
   transitionFor,
   summarizeBusEvent,
+  obcHealthVerdict,
 };
 if (require.main !== module) return;
 
