@@ -33,7 +33,51 @@ const { readEnvMs } = require("../util");
 
 const DEFAULTS = {
   TICK_MS: 5 * 60 * 1000,
+  // The programming block and the album override live on /api/programming
+  // (programming.getStatus()). /api/state carries neither, so every field
+  // this role read off it was permanently null.
+  PROGRAMMING_PATH: "/api/programming",
+  SCHEDULED_HOURS: [11, 21],   // DAILY_SHOWCASES, local radio time
+  TIMEZONE: "America/Chicago", // CST/CDT — the DST transition is the point
+  WINDOW_MIN: 60,              // a showcase is "in progress" for this long
 };
+
+/**
+ * Local wall-clock hour/minute in the radio's timezone (exported for
+ * tests). The old code subtracted a fixed 5 hours from UTC, which is
+ * right for CDT and an hour wrong for CST every winter.
+ */
+function localHourMinute(now, timeZone) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone, hour: "2-digit", minute: "2-digit", hour12: false,
+    }).formatToParts(now);
+    const get = (t) => parseInt(parts.find((p) => p.type === t).value, 10);
+    const hour = get("hour");
+    return { hour: hour === 24 ? 0 : hour, minute: get("minute") };
+  } catch (_) {
+    // No ICU / unknown zone — fall back to the old fixed-offset guess
+    // rather than failing the whole snapshot.
+    return { hour: ((now.getUTCHours() - 5) + 24) % 24, minute: now.getUTCMinutes() };
+  }
+}
+
+/**
+ * Minutes until the next scheduled showcase, or 0 with inProgress=true
+ * when we are inside one. The old arithmetic mapped "now" onto "in ~24h":
+ * during the whole fire hour the countdown read 23-something hours, so
+ * the operator was never told a showcase was actually running.
+ */
+function nextShowcase({ hour, minute }, scheduledHours, windowMin) {
+  let best = null;
+  for (const h of scheduledHours) {
+    const mins = (h - hour) * 60 - minute;
+    if (mins <= 0 && mins > -windowMin) return { inMinutes: 0, inProgress: true, hour: h };
+    const candidate = mins <= 0 ? mins + 24 * 60 : mins;
+    if (best == null || candidate < best.inMinutes) best = { inMinutes: candidate, inProgress: false, hour: h };
+  }
+  return best;
+}
 
 function probeJson(target, timeoutMs = 5000) {
   return new Promise((resolve) => {
@@ -67,6 +111,8 @@ function bootStoryteller(deps) {
 
   const cfg = {
     tickMs: readEnvMs("STORYTELLER_TICK_MS", DEFAULTS.TICK_MS),
+    programmingPath: (process.env.STORYTELLER_PROGRAMMING_PATH || "").trim() || DEFAULTS.PROGRAMMING_PATH,
+    timezone: (process.env.STORYTELLER_TZ || "").trim() || DEFAULTS.TIMEZONE,
     enabled: process.env.STORYTELLER_ENABLED !== "false",
   };
 
@@ -79,39 +125,38 @@ function bootStoryteller(deps) {
 
   async function tick() {
     if (!cfg.enabled) return;
-    const r = await probeJson(`${RADIO_BASE}/api/state`);
+    const r = await probeJson(`${RADIO_BASE}${cfg.programmingPath}`);
     s.lastTick = Date.now();
     if (!r.ok || !r.json) {
-      s.snapshot = { ok: false, error: r.error || "no /api/state" };
+      s.snapshot = { ok: false, error: r.error || `no ${cfg.programmingPath}` };
       return;
     }
     const j = r.json;
-    const override = j.programmingOverride || j.override || j.programming?.override || null;
+    // programming.getStatus() shape: { currentBlock, mood, currentAlbum,
+    // override, ... }. The older /api/state-style names are still accepted
+    // so a radio that has not been upgraded degrades rather than breaks.
+    const override = j.override || j.programmingOverride || j.programming?.override || null;
     const overrideActive = !!(override && (override.until ? Date.now() < override.until : true));
-    // Compute next scheduled-showcase fire from radio's DAILY_SHOWCASES.
-    // The radio exposes the schedule indirectly — we use the well-known
-    // pair (11 AM, 9 PM CST = UTC-5 in May; tz-aware). This is a fixed
-    // rule documented in server/programming.js DAILY_SHOWCASES.
-    const SCHEDULED_HOURS_CST = [11, 21];
-    const now = new Date();
-    const utcHour = now.getUTCHours();
-    const utcMin = now.getUTCMinutes();
-    // CST = UTC-5 (or UTC-6 in standard time). Use UTC-5 as a heuristic;
-    // off-by-one-hour is fine for "next in HH:MM" rough estimate.
-    const cstHour = ((utcHour - 5) + 24) % 24;
-    let nextIn = null;
-    for (const h of SCHEDULED_HOURS_CST) {
-      const diff = ((h - cstHour) + 24) % 24;
-      const mins = diff * 60 - utcMin;
-      const candidate = mins <= 0 ? mins + 24 * 60 : mins;
-      if (nextIn == null || candidate < nextIn) nextIn = candidate;
-    }
+    const local = localHourMinute(new Date(), cfg.timezone);
+    const next = nextShowcase(local, DEFAULTS.SCHEDULED_HOURS, DEFAULTS.WINDOW_MIN);
     s.snapshot = {
       ok: true,
       currentAlbum: j.currentAlbum || (j.programming && j.programming.currentAlbum) || null,
-      block: j.programming?.block || j.block || null,
-      override: overrideActive ? { album: override.album, untilMs: override.until || null, untilHuman: override.until ? new Date(override.until).toISOString() : null } : null,
-      nextShowcase: { inMinutes: nextIn, fixedSchedule: "11 AM + 9 PM CST" },
+      block: j.currentBlock || j.programming?.block || j.block || null,
+      mood: j.mood || null,
+      override: overrideActive
+        ? {
+            album: override.album,
+            untilMs: override.until || null,
+            untilHuman: override.until ? new Date(override.until).toISOString() : null,
+          }
+        : null,
+      localTime: `${String(local.hour).padStart(2, "0")}:${String(local.minute).padStart(2, "0")} ${cfg.timezone}`,
+      nextShowcase: {
+        inMinutes: next ? next.inMinutes : null,
+        inProgress: !!(next && next.inProgress),
+        fixedSchedule: `${DEFAULTS.SCHEDULED_HOURS.map((h) => `${h}:00`).join(" + ")} ${cfg.timezone}`,
+      },
     };
   }
 
@@ -126,4 +171,4 @@ function bootStoryteller(deps) {
   };
 }
 
-module.exports = { bootStoryteller };
+module.exports = { bootStoryteller, localHourMinute, nextShowcase };

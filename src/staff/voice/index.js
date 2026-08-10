@@ -32,7 +32,32 @@ const { readEnvMs } = require("../util");
 const DEFAULTS = {
   TICK_MS: 90 * 1000,
   STUCK_MS: 5 * 60 * 1000,
+  // kannaka-radio exposes the talk-segment lock on its DJ-voice route.
+  // /api/state carries only `djVoice: { enabled }` — none of the lock
+  // fields this role was reading — so the lock always read as free and
+  // VOICE_LOCK_STUCK could never fire.
+  STATUS_PATH: "/api/dj-voice/status",
 };
+
+/**
+ * Read the talk-segment lock out of a radio status payload (exported for
+ * tests). Accepts the /api/dj-voice/status shape and the older
+ * /api/state-style field names so a radio that has not been upgraded
+ * still reports something sane.
+ */
+function lockFromStatus(s) {
+  if (!s || typeof s !== "object") return null;
+  const lockHeld = !!(
+    s.inTalkSegment || s._inTalkSegment ||
+    (s.talk && s.talk.locked) || (s.voice && s.voice.locked)
+  );
+  return {
+    lockHeld,
+    speaking: typeof s.speaking === "boolean" ? s.speaking : null,
+    voiceQueue: s.voice && typeof s.voice.queueDepth === "number" ? s.voice.queueDepth : null,
+    currentSpeaker: (s.voice && s.voice.currentSpeaker) || s.lastIntro || null,
+  };
+}
 
 function probeJson(target, timeoutMs = 5000) {
   return new Promise((resolve) => {
@@ -75,6 +100,7 @@ function bootVoice(deps) {
   const cfg = {
     tickMs: readEnvMs("VOICE_TICK_MS", DEFAULTS.TICK_MS),
     stuckMs: readEnvMs("VOICE_STUCK_MS", DEFAULTS.STUCK_MS),
+    statusPath: (process.env.VOICE_STATUS_PATH || "").trim() || DEFAULTS.STATUS_PATH,
     enabled: process.env.VOICE_ENABLED !== "false",
   };
 
@@ -84,15 +110,18 @@ function bootVoice(deps) {
     lastTick: null,
     lockObservedAt: null,   // ms — when current lock first appeared
     lockStuckAlerted: false,
+    lastSeenAt: null,       // ms — last tick that actually observed the radio
     snapshot: null,
   };
 
+  // Deliberately NOT restoring lockObservedAt/lockStuckAlerted. The
+  // held-duration is a claim about continuous observation, and a restart
+  // breaks exactly that: if the radio restarted too, the lock is new but
+  // the persisted timer is old, and Voice would alert "held 47 min" on a
+  // lock it had watched for seconds. Starting the clock fresh costs at
+  // most one stuckMs window before a genuinely stuck lock is reported.
   try {
-    if (fs.existsSync(STATE_FILE)) {
-      const persisted = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      if (typeof persisted.lockObservedAt === "number") v.lockObservedAt = persisted.lockObservedAt;
-      if (typeof persisted.lockStuckAlerted === "boolean") v.lockStuckAlerted = persisted.lockStuckAlerted;
-    }
+    if (fs.existsSync(STATE_FILE)) JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch (e) { console.warn(`[voice] state load: ${e.message}`); }
 
   function persist() {
@@ -108,17 +137,25 @@ function bootVoice(deps) {
 
   async function tick() {
     if (!cfg.enabled) return;
-    const r = await probeJson(`${RADIO_BASE}/api/state`);
-    v.lastTick = Date.now();
-    if (!r.ok || !r.json) return;
-    // Radio state field names vary by version; check the documented ones.
-    const s = r.json;
-    const lockHeld = !!(s._inTalkSegment || s.inTalkSegment || s.talk?.locked || s.voice?.locked);
-    v.snapshot = {
-      lockHeld,
-      voiceQueue: s.voice && typeof s.voice.queueDepth === "number" ? s.voice.queueDepth : null,
-      currentSpeaker: s.voice && s.voice.currentSpeaker ? s.voice.currentSpeaker : null,
-    };
+    const r = await probeJson(`${RADIO_BASE}${cfg.statusPath}`);
+    const now = Date.now();
+    v.lastTick = now;
+    if (!r.ok || !r.json) {
+      // We could not observe the radio. The held-duration counts OBSERVED
+      // time, so discount the blind interval by pushing the start stamp
+      // forward — otherwise an outage silently accrues "held" minutes and
+      // trips the stuck alert (which restarts the radio) on no evidence.
+      if (v.lockObservedAt != null && v.lastSeenAt != null) {
+        v.lockObservedAt += now - v.lastSeenAt;
+      }
+      v.lastSeenAt = now;
+      return;
+    }
+    v.lastSeenAt = now;
+    const snap = lockFromStatus(r.json);
+    if (!snap) return;
+    const lockHeld = snap.lockHeld;
+    v.snapshot = snap;
     if (lockHeld) {
       if (v.lockObservedAt == null) v.lockObservedAt = Date.now();
       const heldFor = Date.now() - v.lockObservedAt;
@@ -162,4 +199,4 @@ function bootVoice(deps) {
   };
 }
 
-module.exports = { bootVoice };
+module.exports = { bootVoice, lockFromStatus };
