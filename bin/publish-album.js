@@ -22,7 +22,8 @@
  *       --staging /path/to/album-mp3s \
  *       --name "ALBUM NAME" \
  *       --theme "one-line theme" \
- *       --blocks "Midday,Afternoon" \
+ *       --blocks "Afternoon Flow,Evening Signals" \
+ *       [--titles "Track One,Track Two"] \
  *       [--ssh-key ~/.ssh/ninja-portal-ed25519] \
  *       [--ssh-host opc@170.9.238.136] \
  *       [--remote-music /home/opc/kannaka-radio/music]
@@ -52,7 +53,25 @@ function flag(name) { return process.argv.includes(`--${name}`); }
 const staging = arg("staging");
 const albumName = arg("name");
 const theme = arg("theme") || `Untitled — ${albumName}`;
-const blocks = (arg("blocks") || "Midday,Afternoon").split(",").map((s) => s.trim()).filter(Boolean);
+// Default block labels must exist in kannaka-radio's server/programming.js
+// SCHEDULE. "Midday" and "Afternoon" were renamed long ago, so the old
+// defaults made patchProgramming() skip every block with a "not found"
+// warning and report success having patched nothing.
+const KNOWN_BLOCKS = [
+  "Late Night Transmissions",
+  "Morning Resonance",
+  "Peak Frequency",
+  "Afternoon Flow",
+  "Evening Signals",
+  "Night Watch",
+];
+const blocks = (arg("blocks") || "Afternoon Flow,Evening Signals").split(",").map((s) => s.trim()).filter(Boolean);
+const unknownBlocks = blocks.filter((b) => !KNOWN_BLOCKS.includes(b));
+if (unknownBlocks.length > 0) {
+  console.error(`error: unknown block label(s): ${unknownBlocks.join(", ")}`);
+  console.error(`  known blocks: ${KNOWN_BLOCKS.join(" | ")}`);
+  process.exit(1);
+}
 const sshKey = arg("ssh-key", path.join(HOME, ".ssh", "ninja-portal-ed25519"));
 const sshHost = arg("ssh-host", "opc@170.9.238.136");
 const remoteMusic = arg("remote-music", "/home/opc/kannaka-radio/music");
@@ -65,7 +84,7 @@ const showcaseDuration = parseInt(arg("showcase-duration", "35"), 10);
 const radioApi = arg("radio-api", "http://170.9.238.136:8888");
 
 if (!staging || !albumName) {
-  console.error("Usage: publish-album --staging <dir> --name '<ALBUM>' [--theme '...'] [--blocks 'Midday,Afternoon'] [--dry-run]");
+  console.error("Usage: publish-album --staging <dir> --name '<ALBUM>' [--theme '...'] [--blocks 'Afternoon Flow,Evening Signals'] [--titles 'A,B'] [--dry-run]");
   process.exit(1);
 }
 
@@ -76,9 +95,13 @@ if (!fs.existsSync(staging)) {
 
 // ── Read staging dir ────────────────────────────────────────
 const audioExts = /\.(mp3|wav|flac|m4a|ogg)$/i;
+// Numeric-aware sort. A plain .sort() is lexicographic, so a 10+ track
+// album ordered "01, 10, 11, 02, ..." and the ALBUMS patch shipped the
+// tracks out of sequence.
+const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 const trackFiles = fs.readdirSync(staging)
   .filter((f) => audioExts.test(f))
-  .sort();
+  .sort((a, b) => collator.compare(a, b));
 
 if (trackFiles.length === 0) {
   console.error(`error: no audio files in ${staging}`);
@@ -88,6 +111,24 @@ if (trackFiles.length === 0) {
 // Track titles = filename without extension. The radio's findAudioFile
 // matches by basename, so the filename IS the title for routing.
 const titles = trackFiles.map((f) => path.basename(f, path.extname(f)));
+
+// --titles is documented at the top of this file as a validation input:
+// "Validate filenames against the supplied --titles list". It was parsed
+// nowhere, so a typo'd staging dir shipped silently. Titles still come
+// from the filenames (the radio routes by basename) — this only checks
+// that what is staged is what the caller expected.
+const expectedTitles = (arg("titles") || "").split(",").map((s) => s.trim()).filter(Boolean);
+if (expectedTitles.length > 0) {
+  const missing = expectedTitles.filter((t) => !titles.includes(t));
+  const unexpected = titles.filter((t) => !expectedTitles.includes(t));
+  if (missing.length > 0 || unexpected.length > 0) {
+    console.error("error: staging dir does not match --titles");
+    for (const t of missing) console.error(`  missing from staging: ${t}`);
+    for (const t of unexpected) console.error(`  staged but not in --titles: ${t}`);
+    process.exit(1);
+  }
+  console.log(`  ✓ --titles validated (${expectedTitles.length} tracks)`);
+}
 
 console.log(`\n=== Distributor: publish-album ===`);
 console.log(`  staging: ${staging}`);

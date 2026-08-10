@@ -10,8 +10,12 @@
  * with the dream-cron + post-track-announce flows.
  *
  * Routes:
- *   POST /action/marketer-post?text=...&link=...
+ *   POST /action/marketer-post?text=...&link=...[&media=<url>]
  *   GET  /api/marketer
+ *
+ * media is a URL passed straight through to broadcastPost. Without it
+ * the shared broadcaster layer drops the media-only adapters (YouTube)
+ * from the fan-out, so text-only posts never reach that channel.
  *
  * Alerts:
  *   MARKETER_POST_DONE     at least one platform succeeded
@@ -87,12 +91,16 @@ function bootMarketer(deps) {
    * service insulated from third-party crashes (Mastodon SDK has
    * historically thrown on schema drift).
    */
-  function postViaRadioBroadcasters(text, link) {
+  function postViaRadioBroadcasters(text, link, media) {
     return new Promise((resolve) => {
+      // `media` is a URL the broadcaster layer attaches. broadcastPost
+      // filters the media-only adapters (YouTube) out of the fan-out
+      // whenever `!msg.media`, so omitting it — as this always did —
+      // guaranteed the documented YouTube channel was never attempted.
       const code = `
         process.chdir(${JSON.stringify(cfg.radioRepo)});
         const { broadcastPost } = require(${JSON.stringify(path.join(cfg.radioRepo, "server/broadcasters"))});
-        broadcastPost({ text: ${JSON.stringify(text)}, link: ${JSON.stringify(link || "")} }, { rootDir: ${JSON.stringify(cfg.radioRepo)} })
+        broadcastPost({ text: ${JSON.stringify(text)}, link: ${JSON.stringify(link || "")}${media ? `, media: ${JSON.stringify(media)}` : ""} }, { rootDir: ${JSON.stringify(cfg.radioRepo)} })
           .then((results) => { console.log(JSON.stringify(results)); process.exit(0); })
           .catch((e) => { console.error(JSON.stringify({ error: e.message })); process.exit(1); });
       `;
@@ -115,10 +123,11 @@ function bootMarketer(deps) {
     if (!cfg.enabled) return { ok: false, error: "marketer disabled" };
     const text = (query.text || "").toString();
     const link = (query.link || "").toString();
+    const media = (query.media || "").toString();
     if (!text) return { ok: false, error: "missing ?text=" };
     const id = `post_${Date.now().toString(36)}`;
     const startedAt = Date.now();
-    const r = await postViaRadioBroadcasters(text, link);
+    const r = await postViaRadioBroadcasters(text, link, media);
     const finishedAt = Date.now();
     const okCount = Array.isArray(r.results) ? r.results.filter((x) => x.ok).length : 0;
     const totalCount = Array.isArray(r.results) ? r.results.length : 0;
@@ -126,7 +135,7 @@ function bootMarketer(deps) {
     const summary = totalCount > 0
       ? `${okCount}/${totalCount} platforms ok: ${r.results.filter((x) => x.ok).map((x) => x.name).join(",") || "(none)"}`
       : `spawn exit=${r.exit} ${r.error || r.stderr || ""}`.slice(0, 240);
-    const record = { id, text: text.slice(0, 160), link, startedAt, finishedAt, ok: anyOk, summary, results: r.results || [] };
+    const record = { id, text: text.slice(0, 160), link, media, startedAt, finishedAt, ok: anyOk, summary, results: r.results || [] };
     m.history.push(record);
     if (m.history.length > DEFAULTS.HISTORY_MAX) m.history.shift();
     logAlert(anyOk ? "MARKETER_POST_DONE" : "MARKETER_POST_FAILED", `${id} · ${summary}`);
