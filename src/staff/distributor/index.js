@@ -54,14 +54,23 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 
-const { readEnvMs } = require("../util");
+const { readEnvMs, resolveRadioRepo } = require("../util");
 
 const DEFAULTS = {
   JOB_TIMEOUT_MS: 60 * 60 * 1000,    // 60 min
   HISTORY_MAX: 12,
   LOG_TAIL_MAX: 200,                  // most-recent N lines kept in memory
-  RELEASE_SCRIPT: "/home/opc/kannaka-radio/scripts/release-album.sh",
 };
+
+/**
+ * The release pipeline lives in the kannaka-radio checkout, which is at
+ * /home/opc on Oracle but a sibling directory in a normal checkout.
+ * Hardcoding the Oracle path made Distributor refuse every job with
+ * "release script not found" outside production.
+ */
+function defaultReleaseScript() {
+  return path.join(resolveRadioRepo("DISTRIBUTOR_RADIO_REPO"), "scripts", "release-album.sh");
+}
 
 function readEnvStr(name, fallback) {
   const v = (process.env[name] || "").trim();
@@ -74,7 +83,7 @@ function bootDistributor(deps) {
 
   const cfg = {
     jobTimeoutMs: readEnvMs("DISTRIBUTOR_JOB_TIMEOUT_MS", DEFAULTS.JOB_TIMEOUT_MS),
-    releaseScript: readEnvStr("DISTRIBUTOR_RELEASE_SCRIPT", DEFAULTS.RELEASE_SCRIPT),
+    releaseScript: readEnvStr("DISTRIBUTOR_RELEASE_SCRIPT", defaultReleaseScript()),
     enabled: process.env.DISTRIBUTOR_ENABLED !== "false",
   };
 

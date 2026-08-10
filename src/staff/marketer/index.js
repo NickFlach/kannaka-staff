@@ -25,8 +25,9 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 
+const { resolveRadioRepo } = require("../util");
+
 const DEFAULTS = {
-  RADIO_REPO: "/home/opc/kannaka-radio",
   TIMEOUT_MS: 60 * 1000,
   HISTORY_MAX: 20,
 };
@@ -41,7 +42,9 @@ function bootMarketer(deps) {
   const STATE_FILE = path.join(path.dirname(ALERTS_FILE), "marketer-state.json");
 
   const cfg = {
-    radioRepo: readEnvStr("MARKETER_RADIO_REPO", DEFAULTS.RADIO_REPO),
+    // Falls back to a sibling kannaka-radio checkout before the Oracle
+    // path, so the broadcasters resolve in a normal working tree too.
+    radioRepo: resolveRadioRepo("MARKETER_RADIO_REPO"),
     timeoutMs: parseInt(process.env.MARKETER_TIMEOUT_MS || "", 10) || DEFAULTS.TIMEOUT_MS,
     enabled: process.env.MARKETER_ENABLED !== "false",
   };

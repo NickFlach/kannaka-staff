@@ -170,7 +170,12 @@ staffBus.emit = function (subject, event) {
   return _busEmit(subject, event);
 };
 
-const { statusCachePathFor } = require("./staff/util");
+const {
+  statusCachePathFor,
+  hostPortOf,
+  resolveNatsEndpoint,
+  streamMountOf,
+} = require("./staff/util");
 const { bootGrowth } = require("./staff/growth");
 const { bootCurator } = require("./staff/curator");
 const { bootDistributor } = require("./staff/distributor");
@@ -189,8 +194,21 @@ const HRM_SIZE_ALERT_MB = 80; // current is 60 MB; alert when it crosses 80 MB
 const RADIO_BASE = process.env.STAFF_RADIO_BASE || "http://localhost:8888";
 const STREAM_URL = process.env.STAFF_STREAM_URL || "https://radio.ninja-portal.com/stream";
 const OBSERVATORY_BASE = process.env.STAFF_OBSERVATORY_BASE || "http://localhost:3334";
-const NATS_HOST = process.env.STAFF_NATS_HOST || "swarm.ninja-portal.com";
-const NATS_PORT = parseInt(process.env.STAFF_NATS_PORT || "4222", 10);
+const NATS_ENDPOINT = resolveNatsEndpoint(process.env);
+const NATS_HOST = NATS_ENDPOINT.host;
+const NATS_PORT = NATS_ENDPOINT.port;
+// Icecast admin/status endpoint. Firewalled to localhost on the radio
+// host, so it stays a separate setting from the public STREAM_URL — but
+// the mount we look for is read off STREAM_URL rather than hardcoded.
+const ICECAST_BASE = process.env.STAFF_ICECAST_BASE || "http://127.0.0.1:8000";
+const STREAM_MOUNT = streamMountOf(STREAM_URL);
+// The radio's own listen address, derived from RADIO_BASE so a staff
+// instance pointed at a non-default radio probes the right socket.
+const RADIO_ENDPOINT = hostPortOf(RADIO_BASE, "127.0.0.1", 8888);
+// `npm start` in kannaka-radio runs `node server/index.js` with no port
+// flag, so matching on the flag missed the repo's own default launch.
+const RADIO_PROCESS_MATCH = process.env.STAFF_RADIO_PROCESS_MATCH || "node server/index\\.js";
+const RUN_RADIO_SH = process.env.STAFF_RUN_RADIO_SH || "/home/opc/run-radio.sh";
 const TRACK_STALL_MS = 12 * 60_000; // 12 min — covers longest tracks + voice-pause overhead
 // Hardening switch: drop the loopback bypass and demand a signed HMAC
 // from every caller, including the local dashboard.
@@ -319,7 +337,7 @@ function probeTcp(host, port, timeoutMs = 5000) {
 // 8888` is unique to the radio (staff is on 8889, observatory on 3334).
 function probeRadioSingleton() {
   return new Promise((resolve) => {
-    exec("pgrep -f 'node server/index.js --port 8888'", { timeout: 5000 }, (_err, stdout) => {
+    exec(`pgrep -f '${RADIO_PROCESS_MATCH}'`, { timeout: 5000 }, (_err, stdout) => {
       const pids = (stdout || "")
         .split("\n")
         .map((s) => s.trim())
@@ -343,14 +361,15 @@ function probeRadioSingleton() {
 async function probeRadioPortAlive() {
   const sysd = await probeSystemd("kannaka-radio.service");
   if (!sysd.ok) return { ok: false, message: `service not active: ${sysd.message}` };
-  const tcp = await probeTcp("127.0.0.1", 8888, 3000);
+  const { hostname, port } = RADIO_ENDPOINT;
+  const tcp = await probeTcp(hostname, port, 3000);
   if (!tcp.ok) {
     return {
       ok: false,
-      message: "service active but port 8888 silent — http server died inside node, restart needed",
+      message: `service active but ${hostname}:${port} silent — http server died inside node, restart needed`,
     };
   }
-  return { ok: true, message: "service active + port 8888 bound" };
+  return { ok: true, message: `service active + ${hostname}:${port} bound` };
 }
 
 // ADR-003 Probe 3 — metadata mount alignment. icecast-metadata.js
@@ -360,12 +379,12 @@ async function probeRadioPortAlive() {
 // environ is hidden by systemd hardening).
 function probeMetadataMountAlignment() {
   return new Promise((resolve) => {
-    fs.readFile("/home/opc/run-radio.sh", "utf8", (err, content) => {
-      if (err) return resolve({ ok: false, message: `cannot read run-radio.sh: ${err.message}` });
+    fs.readFile(RUN_RADIO_SH, "utf8", (err, content) => {
+      if (err) return resolve({ ok: false, message: `cannot read ${RUN_RADIO_SH}: ${err.message}` });
       const m = content.match(/^\s*export\s+ICECAST_MOUNT=(\S+)/m);
       const mount = m ? m[1].replace(/['"]/g, "") : "/preview";
-      if (mount !== "/stream") {
-        return resolve({ ok: false, message: `ICECAST_MOUNT=${mount} but listeners are on /stream` });
+      if (mount !== STREAM_MOUNT) {
+        return resolve({ ok: false, message: `ICECAST_MOUNT=${mount} but listeners are on ${STREAM_MOUNT}` });
       }
       resolve({ ok: true, message: `ICECAST_MOUNT=${mount}` });
     });
@@ -378,17 +397,17 @@ function probeMetadataMountAlignment() {
 // stalls, source-disconnect-without-restart, and metadata-writer death.
 const _streamTracker = { title: null, lastChangeAt: 0 };
 async function probeStreamMetadataAdvancing() {
-  const r = await probeHttp("http://127.0.0.1:8000/status-json.xsl", { timeout: 5000 });
+  const r = await probeHttp(`${ICECAST_BASE}/status-json.xsl`, { timeout: 5000, maxBody: 200 * 1024 });
   if (!r.ok) return { ok: false, message: `icecast status-json: ${r.error || r.status}` };
   let stream;
   try {
     const d = JSON.parse(r.body).icestats;
     const sources = Array.isArray(d.source) ? d.source : d.source ? [d.source] : [];
-    stream = sources.find((s) => (s.listenurl || "").endsWith("/stream"));
+    stream = sources.find((s) => (s.listenurl || "").endsWith(STREAM_MOUNT));
   } catch (e) {
     return { ok: false, message: `parse error: ${e.message}` };
   }
-  if (!stream) return { ok: false, message: "/stream mount not found in icecast status" };
+  if (!stream) return { ok: false, message: `${STREAM_MOUNT} mount not found in icecast status` };
   const title = stream.title || "";
   const listeners = stream.listeners || 0;
   const now = Date.now();

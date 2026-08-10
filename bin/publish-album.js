@@ -32,8 +32,15 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { execFile, execFileSync } = require("child_process");
+
+// os.homedir() falls back to the platform's own lookup (USERPROFILE on
+// Windows, /etc/passwd elsewhere) when HOME is unset. Interpolating
+// process.env.HOME directly produced literal "undefined/.ssh/..." paths
+// under systemd units and cron, where HOME often is not set.
+const HOME = os.homedir() || ".";
 
 // ── Args ────────────────────────────────────────────────────
 function arg(name, def = null) {
@@ -46,10 +53,10 @@ const staging = arg("staging");
 const albumName = arg("name");
 const theme = arg("theme") || `Untitled — ${albumName}`;
 const blocks = (arg("blocks") || "Midday,Afternoon").split(",").map((s) => s.trim()).filter(Boolean);
-const sshKey = arg("ssh-key", `${process.env.HOME}/.ssh/ninja-portal-ed25519`);
+const sshKey = arg("ssh-key", path.join(HOME, ".ssh", "ninja-portal-ed25519"));
 const sshHost = arg("ssh-host", "opc@170.9.238.136");
 const remoteMusic = arg("remote-music", "/home/opc/kannaka-radio/music");
-const radioRepo = arg("radio-repo", path.join(process.env.HOME || ".", "Source", "kannaka-radio"));
+const radioRepo = arg("radio-repo", path.join(HOME, "Source", "kannaka-radio"));
 const dryRun = flag("dry-run");
 const autoShowcase = flag("showcase"); // implies --deploy + --patch
 const autoDeploy = flag("deploy") || autoShowcase; // implies --patch
