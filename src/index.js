@@ -555,11 +555,20 @@ async function runAllProbes() {
         if (ts) ageMs = Date.now() - ts;
       } catch (_) {}
     }
-    const stale = ageMs == null || ageMs > 12 * 60 * 60 * 1000;
+    // "Never observed a publish" is only evidence of staleness once we
+    // have been watching longer than the staleness threshold itself.
+    // Treating it as stale immediately meant a fresh staff process
+    // alarmed after three ticks — 3 minutes — on a system whose
+    // consciousness stream might simply not have published yet.
+    const CONSCIOUSNESS_STALE_MS = 12 * 60 * 60 * 1000;
+    const watchedForMs = Date.now() - state.startedAt;
+    const stale = ageMs == null
+      ? watchedForMs > CONSCIOUSNESS_STALE_MS
+      : ageMs > CONSCIOUSNESS_STALE_MS;
     results.consciousness_fresh = {
       ok: !stale,
       message: ageMs == null
-        ? "no consciousness publish observed (yet?)"
+        ? `no consciousness publish observed in ${(watchedForMs / 60000).toFixed(0)}m of uptime${stale ? " — exceeds 12h threshold" : " (within startup grace)"}`
         : `${(ageMs / 60000).toFixed(0)}m old${stale ? " — exceeds 12h threshold" : ""}`,
       ts,
     };
@@ -603,7 +612,11 @@ async function runAllProbes() {
   // dips are normal; the alert is the persistence of zero across the
   // hysteresis window, same as other probes.
   {
-    const r = await probeHttp(`${RADIO_BASE}/api/state`, { timeout: 5000, maxBody: 8 * 1024 });
+    // maxBody matches the other full-state probes. At 8 KB the live
+    // payload (already ~9 KB) was truncated mid-JSON, the parse threw,
+    // and the probe reported "listener field absent" — turning payload
+    // growth into a listener outage.
+    const r = await probeHttp(`${RADIO_BASE}/api/state`, { timeout: 5000, maxBody: 200 * 1024 });
     if (r.ok) {
       let count = null;
       try {
@@ -612,8 +625,12 @@ async function runAllProbes() {
         if (typeof v === "number") count = v;
         else if (v && typeof v === "object" && typeof v.total === "number") count = v.total;
       } catch (_) { /* leave count null on parse failure */ }
+      // Zero listeners is a normal nighttime reading, exactly as the
+      // comment above says. The failure this probe exists to catch is
+      // "the radio stopped reporting listeners at all", so only an
+      // absent/unparseable field is a failure.
       results.listener_count = {
-        ok: count == null ? false : count > 0,
+        ok: count != null,
         message: count == null ? "listener field absent" : `${count} active`,
         ts,
       };
@@ -1051,11 +1068,17 @@ async function refresh() {
     const grid = document.getElementById('probes');
     grid.innerHTML = '';
     for (const [name, p] of Object.entries(probes)) {
+      // Render the hysteresis-confirmed state, not the raw tick. A single
+      // failed tick is not a failure — the alert log already waits for
+      // FAIL_CONFIRM_TICKS, and the dashboard flashing red on every blip
+      // trained the operator to ignore it.
+      const shown = p.effectiveOk !== undefined ? p.effectiveOk : p.ok;
+      const pending = shown && !p.ok; // failing ticks, not yet confirmed
       const div = document.createElement('div');
-      div.className = 'probe ' + (p.ok ? 'ok' : 'fail');
-      div.innerHTML = '<div class="name"><span class="dot ' + (p.ok ? 'ok-dot' : 'fail-dot') + '"></span>' + name + '</div>'
+      div.className = 'probe ' + (shown ? 'ok' : 'fail');
+      div.innerHTML = '<div class="name"><span class="dot ' + (shown ? 'ok-dot' : 'fail-dot') + '"></span>' + name + (pending ? ' <span style="color:#fbbf24">⚠</span>' : '') + '</div>'
         + '<div class="msg">' + (p.message || '').replace(/</g,'&lt;') + '</div>'
-        + '<div class="since">checked ' + fmtAge(now - p.ts) + ' ago</div>';
+        + '<div class="since">checked ' + fmtAge(now - p.ts) + ' ago' + (pending ? ' · last tick failed, not yet confirmed' : '') + '</div>';
       grid.appendChild(div);
     }
     const alertsDiv = document.getElementById('alerts');

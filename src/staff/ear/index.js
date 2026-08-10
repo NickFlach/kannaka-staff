@@ -89,6 +89,33 @@ function bufferStats(buf) {
   return { allZero, variance, mean };
 }
 
+/**
+ * Advance the dead-air streak by one observation (exported for tests).
+ *
+ * `sampleOk: false` means the fetch failed — that is the ABSENCE of an
+ * observation, not a silent one, so it breaks the streak. Carrying the
+ * count across such a gap let a silent tick, a transport failure, and
+ * another silent tick add up to "N consecutive silent samples" on two
+ * observations minutes apart, firing the auto-recover radio restart.
+ */
+function nextSilentState({ silentStreak, silentAlerted, sampleOk, isSilent, confirmTicks }) {
+  if (!sampleOk) {
+    return { silentStreak: 0, silentAlerted, alert: null };
+  }
+  if (isSilent) {
+    const streak = silentStreak + 1;
+    if (streak >= confirmTicks && !silentAlerted) {
+      return { silentStreak: streak, silentAlerted: true, alert: "EAR_STREAM_SILENT" };
+    }
+    return { silentStreak: streak, silentAlerted, alert: null };
+  }
+  return {
+    silentStreak: 0,
+    silentAlerted: false,
+    alert: silentAlerted ? "EAR_STREAM_RECOVERED" : null,
+  };
+}
+
 function bootEar(deps) {
   const STREAM_URL = deps.streamUrl;
   const ALERTS_FILE = deps.alertsFile;
@@ -121,12 +148,26 @@ function bootEar(deps) {
     if (fs.existsSync(STATE_FILE)) {
       const persisted = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
       if (typeof persisted.silentAlerted === "boolean") e.silentAlerted = persisted.silentAlerted;
+      // An in-progress streak is real evidence and should survive a
+      // restart — otherwise a restart mid-outage resets the count and the
+      // dead-air alert is pushed another confirmTicks into the future.
+      // Only carry it if it is recent: a streak from a staff process that
+      // died days ago says nothing about the stream right now.
+      if (typeof persisted.silentStreak === "number" && persisted.silentStreak > 0) {
+        const age = Date.now() - (persisted.silentStreakAt || 0);
+        if (age >= 0 && age < cfg.tickMs * 5) e.silentStreak = persisted.silentStreak;
+      }
     }
   } catch (err) { console.warn(`[ear] state load: ${err.message}`); }
 
   function persist() {
-    try { fs.writeFileSync(STATE_FILE, JSON.stringify({ silentAlerted: e.silentAlerted }, null, 2)); }
-    catch (err) { console.warn(`[ear] state save: ${err.message}`); }
+    try {
+      fs.writeFileSync(STATE_FILE, JSON.stringify({
+        silentAlerted: e.silentAlerted,
+        silentStreak: e.silentStreak,
+        silentStreakAt: Date.now(),
+      }, null, 2));
+    } catch (err) { console.warn(`[ear] state save: ${err.message}`); }
   }
   function logAlert(transition, message) {
     const entry = { ts: new Date().toISOString(), probe: "ear", transition, message };
@@ -139,42 +180,51 @@ function bootEar(deps) {
     if (!cfg.enabled) return;
     const r = await sampleStream(STREAM_URL, cfg.sampleBytes);
     e.lastTick = Date.now();
-    if (!r.ok || !r.buf) {
+    const sampleOk = !!(r.ok && r.buf);
+    const stats = sampleOk ? bufferStats(r.buf) : null;
+    const isSilent = sampleOk && (stats.allZero || stats.variance < cfg.silenceThreshold);
+    e.lastStats = sampleOk
+      ? { ok: true, bytes: r.buf.length, ...stats }
       // No bytes — leave the Watcher to handle that case; Ear only
       // cares about silence within otherwise-flowing audio.
-      e.lastStats = { ok: false, error: r.error || `HTTP ${r.status}` };
-      return;
+      : { ok: false, error: r.error || `HTTP ${r.status}` };
+
+    const prevStreak = e.silentStreak;
+    const s = nextSilentState({
+      silentStreak: e.silentStreak,
+      silentAlerted: e.silentAlerted,
+      sampleOk,
+      isSilent,
+      confirmTicks: cfg.confirmTicks,
+    });
+    e.silentStreak = s.silentStreak;
+    e.silentAlerted = s.silentAlerted;
+
+    if (!sampleOk && prevStreak > 0) {
+      console.log(`[ear] sample failed (${e.lastStats.error}) — resetting silent streak of ${prevStreak}`);
     }
-    const stats = bufferStats(r.buf);
-    e.lastStats = { ok: true, bytes: r.buf.length, ...stats };
-    const isSilent = stats.allZero || stats.variance < cfg.silenceThreshold;
-    if (isSilent) {
-      e.silentStreak += 1;
-      if (e.silentStreak >= cfg.confirmTicks && !e.silentAlerted) {
-        logAlert("EAR_STREAM_SILENT", `${e.silentStreak} consecutive silent samples (variance=${stats.variance.toFixed(1)}) — dead air`);
-        e.silentAlerted = true;
-        // Notify other staff roles (per ADR-003). Watcher subscribes
-        // to this subject for the stuck-stream auto-recover loop.
-        publish("KANNAKA.staff.stream.silent", {
-          silentStreak: e.silentStreak,
-          variance: stats.variance,
-          mean: stats.mean,
-          sampleBytes: r.buf.length,
-        });
-      }
-    } else {
-      if (e.silentAlerted) {
-        logAlert("EAR_STREAM_RECOVERED", `audio back (variance=${stats.variance.toFixed(1)})`);
-        publish("KANNAKA.staff.stream.recovered", { variance: stats.variance });
-      }
-      e.silentStreak = 0;
-      e.silentAlerted = false;
+    if (s.alert === "EAR_STREAM_SILENT") {
+      logAlert("EAR_STREAM_SILENT", `${s.silentStreak} consecutive silent samples (variance=${stats.variance.toFixed(1)}) — dead air`);
+      // Notify other staff roles (per ADR-003). Watcher subscribes
+      // to this subject for the stuck-stream auto-recover loop.
+      publish("KANNAKA.staff.stream.silent", {
+        silentStreak: s.silentStreak,
+        variance: stats.variance,
+        mean: stats.mean,
+        sampleBytes: r.buf.length,
+      });
+    } else if (s.alert === "EAR_STREAM_RECOVERED") {
+      logAlert("EAR_STREAM_RECOVERED", `audio back (variance=${stats.variance.toFixed(1)})`);
+      publish("KANNAKA.staff.stream.recovered", { variance: stats.variance });
     }
     persist();
   }
 
-  setTimeout(() => { tick().catch((err) => console.warn(`[ear] first tick: ${err.message}`)); }, 75_000);
-  setInterval(() => { tick().catch((err) => console.warn(`[ear] tick: ${err.message}`)); }, cfg.tickMs);
+  // unref'd so these never hold the event loop open on their own — the
+  // HTTP listener does that in production, and a bootEar() in a test
+  // must not keep the runner alive or reach a live /stream fetch.
+  setTimeout(() => { tick().catch((err) => console.warn(`[ear] first tick: ${err.message}`)); }, 75_000).unref();
+  setInterval(() => { tick().catch((err) => console.warn(`[ear] tick: ${err.message}`)); }, cfg.tickMs).unref();
 
   return {
     getState() {
@@ -191,4 +241,4 @@ function bootEar(deps) {
   };
 }
 
-module.exports = { bootEar };
+module.exports = { bootEar, nextSilentState };
