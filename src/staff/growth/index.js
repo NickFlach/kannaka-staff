@@ -46,7 +46,7 @@ const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
-const { readEnvMs } = require("../util");
+const { readEnvMs, statusCachePathFor } = require("../util");
 
 const DEFAULTS = {
   TICK_MS: 15 * 60 * 1000,            // 15 min
@@ -73,6 +73,10 @@ const DEFAULTS = {
                                             // hang vs. a real long dream
   DREAM_HISTORY_MAX: 20,
   HRM_HISTORY_MAX: 96,                       // 96 × 15min = 24h trend
+  // How long a failed dream holds the cadence off. Without this the
+  // normal-cadence branch relaunches the same broken dream every tick,
+  // because a failure leaves the "last successful dream" stamp at 0.
+  FAIL_BACKOFF_MS: 60 * 60 * 1000,           // 1h
 };
 
 function readEnvMB(name, fallback) {
@@ -85,11 +89,115 @@ function readEnvStr(name, fallback) {
   return v || fallback;
 }
 
+// ── Pure decision helpers (exported for tests) ──────────────
+// Split out of the bootGrowth closure so the suite can drive the
+// cadence and bloat-edge logic directly, without booting timers or
+// exec'ing the kannaka binary.
+
+/**
+ * Edge-trigger for the bloat alert (one-shot per bloat episode). Either
+ * size OR count crossing HARD counts as bloat; recovery needs both back
+ * under SOFT. Returns the transition to log, or null when nothing
+ * changed. Deliberately independent of the in-flight state — a medium
+ * that bloats while a dream is already running is the case the alert
+ * exists for.
+ */
+function bloatTransition({ cfg, sample, bloatedAlerted }) {
+  if (sample.sizeMB == null) return null;
+  const sizeBloated = sample.sizeMB >= cfg.hrmHardMB;
+  const countBloated = sample.memoryCount != null && sample.memoryCount >= cfg.memoryHard;
+  const sizeRecovered = sample.sizeMB < cfg.hrmSoftMB;
+  const countRecovered = sample.memoryCount == null || sample.memoryCount < cfg.memorySoft;
+  if ((sizeBloated || countBloated) && !bloatedAlerted) {
+    const reason = sizeBloated
+      ? `HRM=${sample.sizeMB.toFixed(1)} MB >= ${cfg.hrmHardMB} MB`
+      : `${sample.memoryCount} memories >= ${cfg.memoryHard}`;
+    return {
+      transition: "GROWTH_HRM_BLOATED",
+      message: `${reason} — kicking ${cfg.defaultMode} dream`,
+      bloatedAlerted: true,
+    };
+  }
+  if (sizeRecovered && countRecovered && bloatedAlerted) {
+    const where = sample.memoryCount != null
+      ? `${sample.sizeMB.toFixed(1)} MB / ${sample.memoryCount} memories`
+      : `${sample.sizeMB.toFixed(1)} MB`;
+    return {
+      transition: "GROWTH_HRM_RECOVERED",
+      message: `${where} back under SOFT (${cfg.hrmSoftMB} MB / ${cfg.memorySoft} memories)`,
+      bloatedAlerted: false,
+    };
+  }
+  return null;
+}
+
+/**
+ * One tick's full evaluation: which alert edge to log (if any) and what
+ * to do. The ordering here is load-bearing — the bloat edge is decided
+ * BEFORE the cadence defers to an in-flight dream, because a medium
+ * crossing HARD while a dream is already running is exactly the episode
+ * GROWTH_HRM_BLOATED exists to report.
+ */
+function evaluateTick({ cfg, sample, lastDream, inFlight, bloatedAlerted, now = Date.now() }) {
+  if (!cfg.enabled) return { bloat: null, decision: null };
+  return {
+    bloat: bloatTransition({ cfg, sample, bloatedAlerted }),
+    decision: decideDream({ cfg, sample, lastDream, inFlight, now }),
+  };
+}
+
+/** Cadence decision: { action: "dream"|"wait"|"skip", mode?, reason }. */
+function decideDream({ cfg, sample, lastDream, inFlight, now = Date.now() }) {
+  const inFlightWait = inFlight
+    ? { action: "wait", reason: `dream in flight (${inFlight.mode}, ${Math.round((now - inFlight.startedAt) / 1000)}s)` }
+    : null;
+  if (sample.sizeMB == null) {
+    return inFlightWait || { action: "skip", reason: "HRM not readable on this host" };
+  }
+  if (inFlightWait) return inFlightWait;
+
+  // A failed dream still counts as an attempt. Gating the cadence on
+  // successes alone leaves sinceLast pinned at ~now forever after a
+  // failure, so the normal-cadence branch relaunches the same broken
+  // dream every single tick.
+  if (lastDream && !lastDream.ok) {
+    const sinceFail = now - lastDream.ts;
+    if (sinceFail < cfg.failBackoffMs) {
+      return {
+        action: "skip",
+        reason: `last ${lastDream.mode} dream failed ${Math.round(sinceFail / 60000)}m ago — backoff ${Math.round(cfg.failBackoffMs / 60000)}m`,
+      };
+    }
+  }
+
+  const lastTs = lastDream && lastDream.ok ? lastDream.ts : 0;
+  const sinceLast = now - lastTs;
+
+  if (sample.sizeMB >= cfg.hrmHardMB) {
+    return { action: "dream", mode: cfg.defaultMode, reason: `HRM ${sample.sizeMB.toFixed(1)} MB ≥ HARD ${cfg.hrmHardMB} MB` };
+  }
+  if (sample.memoryCount != null && sample.memoryCount >= cfg.memoryHard) {
+    return { action: "dream", mode: cfg.defaultMode, reason: `${sample.memoryCount} memories ≥ HARD ${cfg.memoryHard}` };
+  }
+  if (sample.sizeMB >= cfg.hrmSoftMB && sinceLast >= cfg.softMinGapMs) {
+    return { action: "dream", mode: cfg.defaultMode, reason: `HRM ${sample.sizeMB.toFixed(1)} MB ≥ SOFT ${cfg.hrmSoftMB} MB + ${Math.round(sinceLast / 3600000)}h since last` };
+  }
+  if (sample.memoryCount != null && sample.memoryCount >= cfg.memorySoft && sinceLast >= cfg.softMinGapMs) {
+    return { action: "dream", mode: cfg.defaultMode, reason: `${sample.memoryCount} memories ≥ SOFT ${cfg.memorySoft} + ${Math.round(sinceLast / 3600000)}h since last` };
+  }
+  if (sinceLast >= cfg.normalIntervalMs) {
+    return { action: "dream", mode: cfg.defaultMode, reason: `${Math.round(sinceLast / 3600000)}h since last (normal cadence)` };
+  }
+  const countStr = sample.memoryCount != null ? `, ${sample.memoryCount} memories` : "";
+  return { action: "skip", reason: `HRM ${sample.sizeMB.toFixed(1)} MB${countStr}, last dream ${Math.round(sinceLast / 60000)}m ago` };
+}
+
 function bootGrowth(deps) {
   const HRM_PATH = deps.hrmPath;
   const ALERTS_FILE = deps.alertsFile;
   const KANNAKA_BIN = readEnvStr("KANNAKA_BIN", "/home/opc/kannaka-memory/target/release/kannaka");
   const STATE_FILE = path.join(path.dirname(ALERTS_FILE), "growth-state.json");
+  const STATUS_CACHE_PATH = statusCachePathFor(HRM_PATH);
 
   const cfg = {
     tickMs: readEnvMs("GROWTH_TICK_MS", DEFAULTS.TICK_MS),
@@ -100,6 +208,7 @@ function bootGrowth(deps) {
     normalIntervalMs: readEnvMs("GROWTH_NORMAL_INTERVAL_MS", DEFAULTS.NORMAL_INTERVAL_MS),
     softMinGapMs: readEnvMs("GROWTH_SOFT_MIN_GAP_MS", DEFAULTS.SOFT_MIN_GAP_MS),
     dreamTimeoutMs: readEnvMs("GROWTH_DREAM_TIMEOUT_MS", DEFAULTS.DREAM_TIMEOUT_MS),
+    failBackoffMs: readEnvMs("GROWTH_FAIL_BACKOFF_MS", DEFAULTS.FAIL_BACKOFF_MS),
     defaultMode: readEnvStr("GROWTH_DEFAULT_MODE", "lite"),
     enabled: process.env.GROWTH_ENABLED !== "false",  // on by default; opt-out
   };
@@ -171,7 +280,10 @@ function bootGrowth(deps) {
     }
     let memoryCount = null;
     try {
-      const cachePath = path.join(process.env.HOME || "/home/opc", ".kannaka", "status-cache.json");
+      // The count cache is a sibling of the HRM it describes. Deriving it
+      // from HOME instead meant a STAFF_HRM_PATH pointing at a second
+      // medium (the witness box) still read the primary's count.
+      const cachePath = STATUS_CACHE_PATH;
       if (fs.existsSync(cachePath)) {
         const j = JSON.parse(fs.readFileSync(cachePath, "utf8"));
         memoryCount = j.total_memories || j.memory_count || j.memories || null;
@@ -217,52 +329,17 @@ function bootGrowth(deps) {
 
   // ── tick — decide whether to launch ─────────────────────
   function decide(sample) {
-    if (!cfg.enabled) return null;
-    if (g.inFlight) {
-      const inFlightAge = Date.now() - g.inFlight.startedAt;
-      return { action: "wait", reason: `dream in flight (${g.inFlight.mode}, ${Math.round(inFlightAge / 1000)}s)` };
+    const { bloat, decision } = evaluateTick({
+      cfg, sample,
+      lastDream: g.lastDream,
+      inFlight: g.inFlight,
+      bloatedAlerted: g.bloatedAlerted,
+    });
+    if (bloat) {
+      logAlert(bloat.transition, bloat.message);
+      g.bloatedAlerted = bloat.bloatedAlerted;
     }
-    if (sample.sizeMB == null) return { action: "skip", reason: "HRM not readable on this host" };
-
-    // Edge-trigger bloat alert (one-shot per bloat episode). Either
-    // size OR count crossing HARD counts as bloat — recovery requires
-    // both to be back under SOFT.
-    const sizeBloated = sample.sizeMB >= cfg.hrmHardMB;
-    const countBloated = sample.memoryCount != null && sample.memoryCount >= cfg.memoryHard;
-    const sizeRecovered = sample.sizeMB < cfg.hrmSoftMB;
-    const countRecovered = sample.memoryCount == null || sample.memoryCount < cfg.memorySoft;
-    if ((sizeBloated || countBloated) && !g.bloatedAlerted) {
-      const reason = sizeBloated
-        ? `HRM=${sample.sizeMB.toFixed(1)} MB >= ${cfg.hrmHardMB} MB`
-        : `${sample.memoryCount} memories >= ${cfg.memoryHard}`;
-      logAlert("GROWTH_HRM_BLOATED", `${reason} — kicking ${cfg.defaultMode} dream`);
-      g.bloatedAlerted = true;
-    } else if (sizeRecovered && countRecovered && g.bloatedAlerted) {
-      const where = sample.memoryCount != null ? `${sample.sizeMB.toFixed(1)} MB / ${sample.memoryCount} memories` : `${sample.sizeMB.toFixed(1)} MB`;
-      logAlert("GROWTH_HRM_RECOVERED", `${where} back under SOFT (${cfg.hrmSoftMB} MB / ${cfg.memorySoft} memories)`);
-      g.bloatedAlerted = false;
-    }
-
-    const lastTs = g.lastDream && g.lastDream.ok ? g.lastDream.ts : 0;
-    const sinceLast = Date.now() - lastTs;
-
-    if (sample.sizeMB >= cfg.hrmHardMB) {
-      return { action: "dream", mode: cfg.defaultMode, reason: `HRM ${sample.sizeMB.toFixed(1)} MB ≥ HARD ${cfg.hrmHardMB} MB` };
-    }
-    if (sample.memoryCount != null && sample.memoryCount >= cfg.memoryHard) {
-      return { action: "dream", mode: cfg.defaultMode, reason: `${sample.memoryCount} memories ≥ HARD ${cfg.memoryHard}` };
-    }
-    if (sample.sizeMB >= cfg.hrmSoftMB && sinceLast >= cfg.softMinGapMs) {
-      return { action: "dream", mode: cfg.defaultMode, reason: `HRM ${sample.sizeMB.toFixed(1)} MB ≥ SOFT ${cfg.hrmSoftMB} MB + ${Math.round(sinceLast / 3600000)}h since last` };
-    }
-    if (sample.memoryCount != null && sample.memoryCount >= cfg.memorySoft && sinceLast >= cfg.softMinGapMs) {
-      return { action: "dream", mode: cfg.defaultMode, reason: `${sample.memoryCount} memories ≥ SOFT ${cfg.memorySoft} + ${Math.round(sinceLast / 3600000)}h since last` };
-    }
-    if (sinceLast >= cfg.normalIntervalMs) {
-      return { action: "dream", mode: cfg.defaultMode, reason: `${Math.round(sinceLast / 3600000)}h since last (normal cadence)` };
-    }
-    const countStr = sample.memoryCount != null ? `, ${sample.memoryCount} memories` : "";
-    return { action: "skip", reason: `HRM ${sample.sizeMB.toFixed(1)} MB${countStr}, last dream ${Math.round(sinceLast / 60000)}m ago` };
+    return decision;
   }
 
   function tick() {
@@ -280,8 +357,12 @@ function bootGrowth(deps) {
 
   // First tick deferred ~30s so a fresh boot doesn't fire a dream before
   // the watcher has had a chance to surface its baseline probes.
-  setTimeout(tick, 30_000);
-  setInterval(tick, cfg.tickMs);
+  // unref'd so these timers never hold the event loop open on their own —
+  // in production the HTTP listener does that, and in tests a bootGrowth()
+  // call must not keep the runner alive (or reach the 30s tick and exec
+  // the kannaka binary).
+  setTimeout(tick, 30_000).unref();
+  setInterval(tick, cfg.tickMs).unref();
 
   // Public surface for HTTP route + manual ops.
   return {
@@ -301,6 +382,10 @@ function bootGrowth(deps) {
     tick,
     /** Force a dream now — useful for the dashboard's manual button. */
     requestDream(mode, reason) {
+      // GROWTH_ENABLED=false has to mean "this host launches no dreams",
+      // not just "the tick loop launches no dreams" — otherwise the
+      // dashboard action walks straight past the opt-out.
+      if (!cfg.enabled) return { ok: false, error: "growth disabled (GROWTH_ENABLED=false)" };
       if (g.inFlight) {
         return { ok: false, error: `dream in flight (${g.inFlight.mode})` };
       }
@@ -311,4 +396,4 @@ function bootGrowth(deps) {
   };
 }
 
-module.exports = { bootGrowth };
+module.exports = { bootGrowth, bloatTransition, decideDream, evaluateTick };

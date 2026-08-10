@@ -152,6 +152,7 @@ staffBus.emit = function (subject, event) {
   return _busEmit(subject, event);
 };
 
+const { statusCachePathFor } = require("./staff/util");
 const { bootGrowth } = require("./staff/growth");
 const { bootCurator } = require("./staff/curator");
 const { bootDistributor } = require("./staff/distributor");
@@ -647,7 +648,9 @@ async function runAllProbes() {
   // 10. hrm_memory_count — local cache read; only on the host that owns it.
   if (!EXTERNAL_MODE) {
     try {
-      const cachePath = path.join(process.env.HOME || "/home/opc", ".kannaka", "status-cache.json");
+      // Matching Growth's sampleHrm(): the count cache belongs to the
+      // configured HRM, not to whatever lives under HOME.
+      const cachePath = statusCachePathFor(HRM_PATH);
       if (fs.existsSync(cachePath)) {
         const j = JSON.parse(fs.readFileSync(cachePath, "utf8"));
         const count = j.total_memories || j.memory_count || j.memories || 0;
