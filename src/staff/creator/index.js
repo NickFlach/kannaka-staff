@@ -140,8 +140,11 @@ function bootCreator(deps) {
         const req = lib.request({
           method: "POST",
           hostname: u.hostname,
-          port: u.port || 443,
-          path: u.pathname,
+          // An http:// OBC_API with no explicit port was dialled on 443,
+          // which never connects. Match the protocol like every other
+          // request helper in this repo.
+          port: u.port || (u.protocol === "https:" ? 443 : 80),
+          path: u.pathname + (u.search || ""),
           headers: {
             "Content-Type": "application/json",
             "Content-Length": Buffer.byteLength(payload),
@@ -170,11 +173,31 @@ function bootCreator(deps) {
     return { ok: false, status: 0, error: `unknown kind: ${kind}` };
   }
 
+  /**
+   * Reasons a request cannot possibly succeed, decided synchronously.
+   * requestCreate answers the HTTP caller before dispatch resolves, so
+   * anything knowable up front has to be checked here — otherwise the
+   * caller is told ok:true for a job that fails microseconds later and
+   * only ever surfaces in alerts.jsonl.
+   */
+  function rejectionFor(kind, q) {
+    if (!kind) return "missing ?kind=oration|image";
+    if (kind === "track") return "use Distributor for full album publishing (release-album.sh)";
+    if (kind === "image") {
+      if (!q.prompt || !q.building_id) return "image requires prompt + building_id";
+      if (!readObcJwt()) return "no OBC JWT (set OPENBOTCITY_JWT or OBC_JWT_FILE)";
+      return null;
+    }
+    if (kind === "oration") return null;
+    return `unknown kind: ${kind}`;
+  }
+
   function requestCreate(query) {
     if (!cfg.enabled) return { ok: false, error: "creator disabled" };
     if (c.current) return { ok: false, error: `job ${c.current.id} in flight (${c.current.kind})` };
     const kind = (query.kind || "").toString();
-    if (!kind) return { ok: false, error: "missing ?kind=oration|image" };
+    const rejection = rejectionFor(kind, query);
+    if (rejection) return { ok: false, kind, error: rejection };
     const id = `gen_${Date.now().toString(36)}`;
     const startedAt = Date.now();
     c.current = { id, kind, startedAt, query };
@@ -213,6 +236,7 @@ function bootCreator(deps) {
       };
     },
     requestCreate,
+    rejectionFor,
   };
 }
 
