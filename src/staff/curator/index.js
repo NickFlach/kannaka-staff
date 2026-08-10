@@ -72,11 +72,7 @@ function probeHttpJson(target, timeoutMs = 5000, maxBody = 200 * 1024) {
       timeout: timeoutMs,
     }, (res) => {
       const chunks = [];
-      let bytes = 0;
-      res.on("data", (c) => {
-        bytes += c.length;
-        if (bytes < maxBody) chunks.push(c);
-      });
+      res.on("data", (c) => { chunks.push(c); });
       const settle = () => {
         const body = Buffer.concat(chunks).toString("utf8").slice(0, maxBody);
         resolve({ ok: res.statusCode >= 200 && res.statusCode < 400, status: res.statusCode, body });
