@@ -1041,25 +1041,55 @@ function recentAlerts(limit = 50) {
 }
 
 /**
- * Explain, for the caller actually asking, whether /action/* will accept
- * an unsigned POST from this page (#9). The dashboard's buttons send a
- * bare fetch with no signature, so on a proxied deployment they can only
- * ever 401 — better to render them inert with the reason than to hand
- * the operator a row of buttons that silently fail.
+ * How this particular caller can drive /action/* from the dashboard (#9).
+ *
+ *   "open"       localhost — an unsigned POST is accepted, buttons live.
+ *   "unlockable" remote with STAFF_SHARED_SECRET set. A bare POST 401s,
+ *                but the page can sign requests itself once the operator
+ *                supplies the secret, so buttons render locked with an
+ *                unlock control rather than inert.
+ *   "refused"    remote with no secret configured — the server 403s every
+ *                remote call, so there is nothing to unlock.
+ *
+ * `enabled` stays as the "can I click this right now, unsigned" flag.
  */
 function actionAvailability({ isLocal, secret }) {
-  if (isLocal) return { enabled: true, reason: "" };
+  if (isLocal) return { mode: "open", enabled: true, reason: "" };
   if (!secret) {
-    return { enabled: false, reason: "remote caller and no STAFF_SHARED_SECRET configured — /action/* refuses every remote request (403)" };
+    return {
+      mode: "refused",
+      enabled: false,
+      reason: "remote caller and no STAFF_SHARED_SECRET configured — /action/* refuses every remote request (403)",
+    };
   }
-  return { enabled: false, reason: "remote caller — /action/* requires an HMAC signature this page cannot produce; use the signed curl recipe below" };
+  return {
+    mode: "unlockable",
+    enabled: false,
+    reason: "remote caller — actions require an HMAC signature; unlock with the shared secret to sign them in your browser",
+  };
 }
 
-function dashboardHtml(availability = { enabled: true, reason: "" }) {
+function dashboardHtml(availability = { mode: "open", enabled: true, reason: "" }) {
+  const mode = availability.mode || (availability.enabled ? "open" : "refused");
+  // Buttons ship disabled unless the caller can already POST unsigned. In
+  // "unlockable" mode the unlock handler re-enables them client-side once
+  // a secret is present; it is never a server-side decision.
   const actionsDisabled = availability.enabled ? "" : " disabled";
   const actionsBanner = availability.enabled
     ? ""
-    : `<div style="padding: 10px 12px; margin: 12px 0; border-left: 3px solid #fbbf24; background: rgba(251,191,36,0.06); font-size: 0.8rem; color: var(--dim);"><strong style="color:#fbbf24;">actions unavailable</strong> — ${availability.reason}</div>`;
+    : mode === "unlockable"
+      ? `<div id="lockBar" style="padding: 10px 12px; margin: 12px 0; border-left: 3px solid #fbbf24; background: rgba(251,191,36,0.06); font-size: 0.8rem; color: var(--dim);">
+  <strong style="color:#fbbf24;">🔒 actions locked</strong> — ${availability.reason}
+  <div style="margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+    <input id="secretInput" type="password" placeholder="STAFF_SHARED_SECRET" autocomplete="off" spellcheck="false"
+      style="background: rgba(255,255,255,0.04); border: 1px solid rgba(148,163,184,0.3); border-radius: 4px; color: var(--ink); font-family: inherit; font-size: 0.8rem; padding: 5px 8px; min-width: 260px;">
+    <button onclick="unlockActions()" class="btn">🔓 unlock</button>
+    <button onclick="lockActions()" class="btn" id="lockBtn" style="display:none;">🔒 lock</button>
+    <span id="lockNote" style="color: var(--dim);"></span>
+  </div>
+  <div style="margin-top: 6px; color: var(--dim);">The secret is held in this tab only (sessionStorage) and is never sent — requests carry an HMAC signature derived from it, exactly like the signed curl recipe below.</div>
+</div>`
+      : `<div style="padding: 10px 12px; margin: 12px 0; border-left: 3px solid #fbbf24; background: rgba(251,191,36,0.06); font-size: 0.8rem; color: var(--dim);"><strong style="color:#fbbf24;">actions unavailable</strong> — ${availability.reason}</div>`;
   return `<!doctype html><html><head>
 <title>kannaka-staff — watcher</title>
 <meta charset="utf-8">
@@ -1367,12 +1397,75 @@ async function refresh() {
 refresh();
 setInterval(refresh, 10000);
 
+// ── Client-side action signing (#9) ─────────────────────────
+// The server accepts an unsigned POST only from a genuine localhost
+// caller. Everyone else must present the same HMAC the signed-curl
+// recipe above produces: HMAC-SHA256 over TS + LF + METHOD + LF + PATH,
+// hex. crypto.subtle does that natively, so nothing cryptographic is
+// shipped to the page and the secret itself is never transmitted.
+//
+// The signed path must be byte-identical to the request path, because
+// the server signs req.url — query string included.
+const SECRET_KEY = 'staffSharedSecret';
+function storedSecret() {
+  try { return sessionStorage.getItem(SECRET_KEY) || ''; } catch (_) { return ''; }
+}
+function canSign() {
+  return !!(window.crypto && window.crypto.subtle);
+}
+async function signPath(secret, method, path) {
+  const ts = String(Date.now());
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const buf = await crypto.subtle.sign('HMAC', key, enc.encode(ts + '\\n' + method + '\\n' + path));
+  const sig = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return { ts, sig };
+}
+function setActionsEnabled(on) {
+  document.querySelectorAll('.actions .btn, .alerts .btn').forEach(b => { b.disabled = !on; });
+  const lockBtn = document.getElementById('lockBtn');
+  if (lockBtn) lockBtn.style.display = on ? '' : 'none';
+}
+function unlockActions() {
+  const note = document.getElementById('lockNote');
+  const input = document.getElementById('secretInput');
+  if (!canSign()) {
+    note.innerHTML = '<span style="color: var(--fail)">this browser cannot sign — crypto.subtle needs a secure context (https or localhost). Use the signed curl recipe below.</span>';
+    return;
+  }
+  const v = (input.value || '').trim();
+  if (!v) { note.innerHTML = '<span style="color: var(--fail)">enter the secret first</span>'; return; }
+  try { sessionStorage.setItem(SECRET_KEY, v); } catch (_) {}
+  input.value = '';
+  setActionsEnabled(true);
+  note.innerHTML = '<span style="color: var(--ok)">🔓 unlocked for this tab — a wrong secret will still be rejected by the server (401)</span>';
+}
+function lockActions() {
+  try { sessionStorage.removeItem(SECRET_KEY); } catch (_) {}
+  setActionsEnabled(false);
+  const note = document.getElementById('lockNote');
+  if (note) note.innerHTML = '🔒 locked — secret cleared from this tab';
+}
+// Restore an unlock across a page refresh within the same tab.
+if (document.getElementById('lockBar') && storedSecret() && canSign()) {
+  setActionsEnabled(true);
+  document.getElementById('lockNote').innerHTML = '<span style="color: var(--ok)">🔓 unlocked for this tab</span>';
+}
+
 async function act(action, params) {
   const result = document.getElementById('actionResult');
   result.textContent = '⏳ ' + action + '…';
   const qs = params ? '?' + new URLSearchParams(params).toString() : '';
   try {
-    const r = await fetch('/action/' + action + qs, { method: 'POST' });
+    const path = '/action/' + action + qs;
+    const opts = { method: 'POST' };
+    const secret = storedSecret();
+    if (secret && canSign()) {
+      const { ts, sig } = await signPath(secret, 'POST', path);
+      opts.headers = { 'X-Staff-Timestamp': ts, 'X-Staff-Signature': sig };
+    }
+    const r = await fetch(path, opts);
     const j = await r.json();
     result.textContent = (j.ok ? '✓ ' : '✗ ') + action + ' — ' + (j.note || j.body || j.error || '').toString().slice(0, 200);
     setTimeout(() => refresh(), 3000);
@@ -1545,6 +1638,10 @@ module.exports = {
   transitionFor,
   summarizeBusEvent,
   obcHealthVerdict,
+  // Exported so the suite can render the page and parse its inline script.
+  // That JS lives inside a template literal, where `node --check
+  // src/index.js` cannot see a syntax error in it.
+  dashboardHtml,
 };
 if (require.main !== module) return;
 
