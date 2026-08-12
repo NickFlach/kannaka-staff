@@ -980,8 +980,9 @@ async function handleAction(action, query) {
         }
         const child = exec(`${bin} dream --mode lite`, { timeout: 900_000 }, () => {});
         child.on("error", (e) => resolve({ ok: false, kind: "dream", error: `spawn failed: ${e.message}` }));
+        // ADR-004 W1: a confirmed spawn is accepted work, not completed work.
         child.on("spawn", () => resolve({
-          ok: true, kind: "dream", pid: child.pid,
+          accepted: true, kind: "dream", pid: child.pid,
           note: "spawned in background; watch hrm_size + observatory_serving probes",
         }));
       });
@@ -1467,7 +1468,9 @@ async function act(action, params) {
     }
     const r = await fetch(path, opts);
     const j = await r.json();
-    result.textContent = (j.ok ? '✓ ' : '✗ ') + action + ' — ' + (j.note || j.body || j.error || '').toString().slice(0, 200);
+    // ok = completed; accepted = queued (jobId in flight); neither = refused/failed.
+    const mark = j.ok ? '✓ ' : (j.accepted ? '⏳ accepted ' : '✗ ');
+    result.textContent = mark + action + ' — ' + (j.jobId ? j.jobId + ' · ' : '') + (j.note || j.body || j.error || '').toString().slice(0, 200);
     setTimeout(() => refresh(), 3000);
   } catch (e) {
     result.textContent = '✗ ' + action + ' — ' + e.message;
@@ -1609,7 +1612,11 @@ const server = http.createServer((req, res) => {
     // authorized: localhost (always allowed) OR signed remote (verified above)
     handleAction(action, url.parse(req.url, true).query)
       .then((r) => {
-        res.writeHead(r.ok ? 200 : 500, { "Content-Type": "application/json" });
+        // ADR-004 W1 result contract: 200 = work completed (ok), 202 = work
+        // queued/launched (accepted, outcome arrives via history + bus),
+        // 500 = refused or failed. `ok:true` is never sent for queued work.
+        const code = r.ok ? 200 : (r.accepted ? 202 : 500);
+        res.writeHead(code, { "Content-Type": "application/json" });
         res.end(JSON.stringify(r));
       })
       .catch((e) => {

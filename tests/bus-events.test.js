@@ -57,7 +57,9 @@ test("#41 regression: Creator publishes job.start and job.failed", async () => {
   // synchronously, so it no longer reaches the bus at all.
   const done = waitFor(bus, "KANNAKA.staff.creator.job.failed");
   const r = creator.requestCreate({ kind: "oration" });
-  assert.strictEqual(r.ok, true, "the job is accepted, then fails in dispatch");
+  // ADR-004 W1: queued work is accepted, never ok — ok is for completed work.
+  assert.strictEqual(r.accepted, true, "the job is accepted, then fails in dispatch");
+  assert.notStrictEqual(r.ok, true, "queued work must not claim ok");
   await done;
 
   const subjects = seen.map((s) => s.subject);
@@ -109,7 +111,9 @@ test("#41 regression: Distributor publishes job.start", () => {
   const r = distributor.requestPublish({ configPath, skip: "" });
   // The spawned bash may or may not exist on this box; either way the
   // START publication happens synchronously at request time.
-  assert.strictEqual(r.ok, true, r.error);
+  // ADR-004 W1: queued work is accepted, never ok.
+  assert.strictEqual(r.accepted, true, r.error);
+  assert.notStrictEqual(r.ok, true, "queued work must not claim ok");
   const start = seen.find((s) => s.subject === "KANNAKA.staff.distributor.job.start");
   assert.ok(start, `missing job.start in ${seen.map((s) => s.subject)}`);
   assert.strictEqual(start.event.source, "distributor");

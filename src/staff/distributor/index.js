@@ -237,7 +237,9 @@ function bootDistributor(deps) {
       persist();
     });
 
-    return { ok: true, jobId: id, name };
+    // ADR-004 W1: queued work is *accepted*, not *ok*. `ok` is reserved for
+    // completed work; the caller holds jobId and watches history/the bus.
+    return { accepted: true, jobId: id, name };
   }
 
   return {
