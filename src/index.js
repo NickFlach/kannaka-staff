@@ -148,6 +148,70 @@ function obcHealthVerdict(r, expectService = "openbotcity-api") {
   return { ok: true, message: `${j.service} status=ok` };
 }
 
+// ── ADR-004 W5: the staff witnesses itself ──────────────────
+// The staff has no probe on the staff. Two additions: a NATS heartbeat an
+// outside observer can watch die, and /api/health tick freshness so
+// "process-alive-but-loop-wedged" is visible to one curl — the same
+// treatment ADR-002 gave "process-alive-but-port-silent".
+
+/** Wire bytes for a minimal NATS publish (CONNECT + PUB). Pure, so the
+ * frame format is testable without a socket. The repo is dependency-free
+ * by design; the NATS text protocol is small enough to keep it that way. */
+function natsPublishFrames(subject, payloadObj) {
+  const payload = Buffer.from(JSON.stringify(payloadObj), "utf8");
+  const connect = 'CONNECT {"verbose":false,"pedantic":false,"name":"kannaka-staff"}\r\n';
+  const pub = `PUB ${subject} ${payload.length}\r\n`;
+  return Buffer.concat([Buffer.from(connect, "utf8"), Buffer.from(pub, "utf8"), payload, Buffer.from("\r\n", "utf8")]);
+}
+
+/** Fire-and-forget heartbeat publish over raw TCP. Resolves {ok, error?};
+ * never throws, never retries — a missed beat IS the signal an outside
+ * watcher is listening for. */
+function publishNatsHeartbeat({ host, port, subject, payload, timeoutMs = 4000 }) {
+  return new Promise((resolve) => {
+    const net = require("net");
+    const sock = net.connect({ host, port });
+    let settled = false;
+    const settle = (r) => { if (!settled) { settled = true; try { sock.destroy(); } catch (_) {} resolve(r); } };
+    sock.setTimeout(timeoutMs, () => settle({ ok: false, error: "timeout" }));
+    sock.on("error", (e) => settle({ ok: false, error: e.message }));
+    sock.once("data", () => {
+      // Server INFO received; send CONNECT+PUB and give the write a beat
+      // to flush before closing.
+      sock.write(natsPublishFrames(subject, payload), () => {
+        setTimeout(() => settle({ ok: true }), 50);
+      });
+    });
+  });
+}
+
+/** Per-subsystem freshness verdict. Pure — drive it with fake clocks.
+ * A subsystem is stale when its last tick is older than 2× its interval
+ * (one missed tick is scheduling jitter; two is a wedge). */
+function healthSnapshot({ now, startedAt, probeLastTick, probeTickMs, roles = {}, heartbeat = null }) {
+  const subsystems = {};
+  const staleOf = (lastTick, intervalMs) => {
+    if (!lastTick) return { lastTick: null, stale: true, reason: "never ticked" };
+    const ageMs = now - lastTick;
+    return ageMs > 2 * intervalMs
+      ? { lastTick, ageMs, stale: true, reason: `last tick ${Math.round(ageMs / 1000)}s ago (interval ${Math.round(intervalMs / 1000)}s)` }
+      : { lastTick, ageMs, stale: false };
+  };
+  subsystems.probes = staleOf(probeLastTick, probeTickMs);
+  for (const [name, r] of Object.entries(roles)) {
+    subsystems[name] = r.online
+      ? (r.lastTick !== undefined ? staleOf(r.lastTick, r.tickMs) : { online: true, stale: false })
+      : { online: false, stale: false, reason: r.reason || "not booted on this host" };
+  }
+  if (heartbeat) {
+    subsystems.heartbeat = heartbeat.lastSentTs
+      ? { ...staleOf(heartbeat.lastSentTs, heartbeat.intervalMs), lastError: heartbeat.lastError || null }
+      : { lastTick: null, stale: true, reason: heartbeat.lastError ? `never sent (${heartbeat.lastError})` : "never sent" };
+  }
+  const wedged = Object.entries(subsystems).filter(([, s]) => s.stale).map(([n]) => n);
+  return { ok: wedged.length === 0, now, startedAt, uptimeMs: startedAt ? now - startedAt : null, wedged, subsystems };
+}
+
 /** Build a busRing entry for a KANNAKA.* event, or null to skip (ADR-003). */
 function summarizeBusEvent(subject, event) {
   if (typeof subject !== "string" || !subject.startsWith("KANNAKA.")) return null;
@@ -245,6 +309,17 @@ const state = {
   lastTick: null,
   probes: {}, // {name: {ok, message, ts, lastChangeAt, history: [latest 5]}}
   trackTracker: { lastTitle: null, lastChangeTs: Date.now() },
+};
+
+// ADR-004 W5 heartbeat state. Enabled unless STAFF_HEARTBEAT=0; the beat
+// rides the probe cadence so an outside watcher's staleness math matches
+// /api/health's.
+const HEARTBEAT = {
+  enabled: (process.env.STAFF_HEARTBEAT || "").trim() !== "0",
+  subject: "KANNAKA.staff.heartbeat",
+  intervalMs: TICK_MS,
+  lastSentTs: null,
+  lastError: null,
 };
 
 // ── Probes ──────────────────────────────────────────────────
@@ -1625,6 +1700,30 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ ok: true, count: busRing.length, events: busRing.slice().reverse() }));
     return;
   }
+  if (req.url === "/api/health") {
+    // ADR-004 W5: per-subsystem tick freshness. HTTP 200 only when nothing
+    // is wedged — a stale loop is a 503, visible to one curl.
+    const snap = healthSnapshot({
+      now: Date.now(),
+      startedAt: state.startedAt,
+      probeLastTick: state.lastTick,
+      probeTickMs: TICK_MS,
+      roles: {
+        growth: { online: !!growth },
+        curator: { online: !!curator },
+        distributor: { online: !!distributor },
+        creator: { online: !!creator },
+        marketer: { online: !!marketer },
+        voice: { online: !!voice },
+        ear: { online: !!ear },
+        storyteller: { online: !!storyteller },
+      },
+      heartbeat: HEARTBEAT.enabled ? HEARTBEAT : null,
+    });
+    res.writeHead(snap.ok ? 200 : 503, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(snap));
+    return;
+  }
   // ── Operations console: write actions ───────────────────────
   // Each action wraps a known operational pattern. Authentication
   // model: if STAFF_SHARED_SECRET is configured (production), require
@@ -1699,6 +1798,9 @@ module.exports = {
   ACTION_REGISTRY,
   actionGate,
   actionAuditEntry,
+  natsPublishFrames,
+  publishNatsHeartbeat,
+  healthSnapshot,
   verifyStaffHmac,
   cooldownRemainingMs,
   computeEffectiveOk,
@@ -1994,6 +2096,35 @@ server.listen(PORT, () => {
   console.log(`[staff] alerts log: ${ALERTS_FILE}`);
   console.log(`[staff] probing every ${TICK_MS / 1000}s`);
 });
+
+// ── ADR-004 W5: NATS heartbeat ──────────────────────────────
+// KANNAKA.staff.heartbeat every tick, so the observatory/swarm can see the
+// staff die (or wedge) from OUTSIDE the process. Fire-and-forget: a failed
+// publish records lastError for /api/health but never blocks the loop —
+// the missed beat itself is the outside watcher's signal.
+if (HEARTBEAT.enabled) {
+  const beat = async () => {
+    const r = await publishNatsHeartbeat({
+      host: NATS_HOST,
+      port: NATS_PORT,
+      subject: HEARTBEAT.subject,
+      payload: {
+        ts: Date.now(),
+        source: "staff",
+        uptimeS: Math.round((Date.now() - state.startedAt) / 1000),
+        probeLastTick: state.lastTick,
+        probeCount: Object.keys(state.probes).length,
+      },
+    });
+    if (r.ok) { HEARTBEAT.lastSentTs = Date.now(); HEARTBEAT.lastError = null; }
+    else { HEARTBEAT.lastError = r.error || "publish failed"; }
+  };
+  beat();
+  setInterval(beat, HEARTBEAT.intervalMs).unref();
+  console.log(`[staff] heartbeat online — ${HEARTBEAT.subject} → ${NATS_HOST}:${NATS_PORT} every ${Math.round(HEARTBEAT.intervalMs / 1000)}s`);
+} else {
+  console.log("[staff] heartbeat disabled (STAFF_HEARTBEAT=0)");
+}
 
 // Test/CI safety: self-destruct after a TTL so a smoke-test can never leak a
 // stray server. On Windows/Git Bash `node … & kill $!` often misses the real
