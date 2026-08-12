@@ -53,6 +53,34 @@ Designed to live on the same box as kannaka-radio + kannaka-memory so the watche
 
 ---
 
+## Operate (ADR-004 — truthful operations)
+
+The staff holds itself to the standard it holds the constellation to: every
+surface can say "no", and says it when the "no" is knowable.
+
+- **Action results are honest.** `/action/*` returns `ok:true` only for
+  *completed* work (HTTP 200). Queued/launched work returns
+  `{ accepted: true, jobId }` (HTTP **202**) — outcome lands in role history,
+  `alerts.jsonl`, and the bus. Preflight failures refuse immediately (500),
+  nothing queued.
+- **Per-action kill switches.** Every write-action honors
+  `STAFF_ACTION_<NAME>=0` (e.g. `STAFF_ACTION_RESTART_RADIO=0`) and refuses
+  visibly when disabled. The authoritative action registry is the governance
+  table in [ADR-004](docs/adr/ADR-004-truthful-operations.md) — code, registry,
+  and table are sync-tested.
+- **Audit provenance.** Every write-action leaves an `alerts.jsonl` row with
+  an `actor` (`operator:local`, `operator:hmac`, or `staff:<loop>`) — nobody
+  guesses who restarted the radio at 03:11.
+- **`GET /api/health`** — per-subsystem tick freshness (probe loop, all nine
+  roles, the heartbeat). Anything whose last tick is older than 2× its
+  interval flips the endpoint to **503**: process-alive-but-loop-wedged,
+  visible to one curl.
+- **`KANNAKA.staff.heartbeat`** — published to the swarm NATS every probe
+  tick so an *outside* watcher can see the staff die. `STAFF_HEARTBEAT=0`
+  disables.
+
+---
+
 ## Constellation
 
 | repo | role |
