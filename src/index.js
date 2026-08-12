@@ -943,7 +943,55 @@ async function tick() {
 }
 
 // ── Operations actions ──────────────────────────────────────
+// ── ADR-004 W4: write-action governance ─────────────────────
+// The registry mirrors the governance table in
+// docs/adr/ADR-004-truthful-operations.md — the authoritative list of
+// write-actions. A new action adds a `case` below, a row here, and a row
+// in the ADR table, all in the same PR (tests/action-governance.test.js
+// fails the build if the three drift apart).
+const ACTION_REGISTRY = {
+  "restart-radio": { flag: "STAFF_ACTION_RESTART_RADIO" },
+  "restart-observatory": { flag: "STAFF_ACTION_RESTART_OBSERVATORY" },
+  "trigger-oration": { flag: "STAFF_ACTION_TRIGGER_ORATION" },
+  "trigger-showcase": { flag: "STAFF_ACTION_TRIGGER_SHOWCASE" },
+  "trigger-dream": { flag: "STAFF_ACTION_TRIGGER_DREAM" },
+  "growth-dream": { flag: "STAFF_ACTION_GROWTH_DREAM" },
+  "distributor-publish": { flag: "STAFF_ACTION_DISTRIBUTOR_PUBLISH" },
+  "creator-request": { flag: "STAFF_ACTION_CREATOR_REQUEST" },
+  "marketer-post": { flag: "STAFF_ACTION_MARKETER_POST" },
+  "curator-rescue": { flag: "STAFF_ACTION_CURATOR_RESCUE" },
+};
+
+/** Per-action enable gate. Default on; `<flag>=0` (or `false`) disables.
+ * A disabled action refuses visibly — it is never skipped silently. */
+function actionGate(action, env = process.env) {
+  const reg = ACTION_REGISTRY[action];
+  if (!reg) return { registered: false, enabled: true };
+  const v = (env[reg.flag] || "").trim().toLowerCase();
+  const enabled = v !== "0" && v !== "false";
+  return { registered: true, enabled, flag: reg.flag };
+}
+
+/** One audit row per write-action request, with actor provenance —
+ * post-incident review must never guess who restarted the radio at 03:11.
+ * actor: "operator:local" | "operator:hmac" | "staff:<loop>". */
+function actionAuditEntry({ actor, action, result, detail }) {
+  return {
+    ts: new Date().toISOString(),
+    probe: "action",
+    transition: "ACTION_AUDIT",
+    actor,
+    action,
+    result, // "ok" | "accepted" | "refused"
+    message: `${actor} → ${action}: ${result}${detail ? ` — ${String(detail).slice(0, 200)}` : ""}`,
+  };
+}
+
 async function handleAction(action, query) {
+  const gate = actionGate(action);
+  if (gate.registered && !gate.enabled) {
+    return { ok: false, disabled: true, error: `action disabled (${gate.flag}=0)` };
+  }
   switch (action) {
     case "restart-radio":
       return execActionLocal("sudo", ["/bin/systemctl", "restart", "kannaka-radio"]);
@@ -1014,7 +1062,7 @@ async function handleAction(action, query) {
       // KANNAKA.staff.album.starving publish path; still honors the
       // 24h global cooldown — pass ?force=1 to override for one shot).
       if (query.force === "1") AUTO_RESCUE.lastRescueTs = 0;
-      return fireRescue("manual operator trigger from dashboard");
+      return fireRescue("manual operator trigger from dashboard", "operator");
     }
     default:
       return { ok: false, error: `unknown action: ${action}` };
@@ -1612,6 +1660,15 @@ const server = http.createServer((req, res) => {
     // authorized: localhost (always allowed) OR signed remote (verified above)
     handleAction(action, url.parse(req.url, true).query)
       .then((r) => {
+        // ADR-004 W4: every operator-initiated write-action leaves an audit
+        // row with actor provenance, whatever its outcome.
+        const entry = actionAuditEntry({
+          actor: isLocal ? "operator:local" : "operator:hmac",
+          action,
+          result: r.ok ? "ok" : (r.accepted ? "accepted" : "refused"),
+          detail: r.jobId || r.error || "",
+        });
+        try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(entry) + "\n"); } catch (_) {}
         // ADR-004 W1 result contract: 200 = work completed (ok), 202 = work
         // queued/launched (accepted, outcome arrives via history + bus),
         // 500 = refused or failed. `ok:true` is never sent for queued work.
@@ -1639,6 +1696,9 @@ module.exports = {
   parsePort,
   isLocalCaller,
   actionAvailability,
+  ACTION_REGISTRY,
+  actionGate,
+  actionAuditEntry,
   verifyStaffHmac,
   cooldownRemainingMs,
   computeEffectiveOk,
@@ -1783,6 +1843,7 @@ function runAutoRecoverRestart(reason) {
     ts: new Date().toISOString(),
     probe: "auto-recover",
     transition: "AUTO_RECOVER_RESTART",
+    actor: "staff:auto-recover", // ADR-004 W4 provenance
     message: `${reason} — restarting kannaka-radio`,
   };
   try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(entry) + "\n"); } catch (_) {}
@@ -1807,6 +1868,7 @@ function runAutoRecoverRestart(reason) {
       ts: new Date().toISOString(),
       probe: "auto-recover",
       transition: err ? "AUTO_RECOVER_FAILED" : "AUTO_RECOVER_DONE",
+      actor: "staff:auto-recover", // ADR-004 W4 provenance
       message: err
         ? `restart failed: ${err.message} ${(errOut || "").slice(0, 200)} — cooldown released for retry`
         : "kannaka-radio restart completed",
@@ -1842,7 +1904,7 @@ const AUTO_RESCUE = {
   cooldownMs: parseInt(process.env.AUTO_RESCUE_COOLDOWN_MS || "", 10) || 24 * 60 * 60 * 1000,
   durationMin: parseInt(process.env.AUTO_RESCUE_DURATION_MIN || "", 10) || 20,
 };
-async function fireRescue(reason) {
+async function fireRescue(reason, actor = "staff:album-rescue") {
   if (!curator) return { ok: false, error: "curator not online" };
   const now = Date.now();
   const sinceLast = now - AUTO_RESCUE.lastRescueTs;
@@ -1865,6 +1927,7 @@ async function fireRescue(reason) {
       ts: new Date().toISOString(),
       probe: "auto-rescue",
       transition: "AUTO_RESCUE_FAILED",
+      actor, // ADR-004 W4 provenance
       message: `"${target.album}" — ${staleHrs}h stale — showcase ${AUTO_RESCUE.durationMin}min (${reason}) — ${detail} — cooldown released for retry`,
     };
     try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(entry) + "\n"); } catch (_) {}
@@ -1898,6 +1961,7 @@ async function fireRescue(reason) {
           ts: new Date().toISOString(),
           probe: "auto-rescue",
           transition: "AUTO_RESCUE_FIRED",
+          actor, // ADR-004 W4 provenance
           message: `"${target.album}" — ${staleHrs}h stale — showcase ${AUTO_RESCUE.durationMin}min (${reason}) — HTTP ${res.statusCode}`,
         };
         try { fs.appendFileSync(ALERTS_FILE, JSON.stringify(entry) + "\n"); } catch (_) {}

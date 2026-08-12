@@ -123,12 +123,20 @@ action surface, we are there.
 
 | action | trigger(s) | flag | cooldown |
 |---|---|---|---|
-| restart-radio | stream.silent, voice.lock.stuck, operator | `STAFF_ACTION_RESTART_RADIO` | shared 30 m |
-| album-rescue | album.starving, operator | `STAFF_ACTION_ALBUM_RESCUE` | per-album |
-| creator-request | operator | `STAFF_ACTION_CREATOR_REQUEST` | none |
-| publish-album | operator | `STAFF_ACTION_PUBLISH_ALBUM` | none |
+| restart-radio | stream.silent, voice.lock.stuck, operator | `STAFF_ACTION_RESTART_RADIO` | shared 30 m (loop path) |
+| restart-observatory | operator | `STAFF_ACTION_RESTART_OBSERVATORY` | none |
+| trigger-oration | operator | `STAFF_ACTION_TRIGGER_ORATION` | none |
+| trigger-showcase | operator | `STAFF_ACTION_TRIGGER_SHOWCASE` | none |
+| trigger-dream | operator (legacy alias) | `STAFF_ACTION_TRIGGER_DREAM` | Growth in-flight guard |
+| growth-dream | operator | `STAFF_ACTION_GROWTH_DREAM` | Growth in-flight guard |
+| distributor-publish | operator | `STAFF_ACTION_DISTRIBUTOR_PUBLISH` | one job in flight |
+| creator-request | operator | `STAFF_ACTION_CREATOR_REQUEST` | one job in flight |
+| marketer-post | operator | `STAFF_ACTION_MARKETER_POST` | none |
+| curator-rescue | album.starving (as album-rescue loop), operator | `STAFF_ACTION_CURATOR_RESCUE` | 24 h global |
 
-New write-actions add a row here in the same PR that adds the code.
+New write-actions add a row here, a row in `ACTION_REGISTRY`
+(`src/index.js`), and a `case` in `handleAction`, all in the same PR —
+`tests/action-governance.test.js` fails the build if the three drift.
 
 ### W5 — The staff witnesses itself
 
