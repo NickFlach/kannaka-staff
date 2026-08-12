@@ -236,7 +236,9 @@ function bootCreator(deps) {
         publish("KANNAKA.staff.creator.job.failed", { id, kind, status: 0, message });
         persist();
       });
-    return { ok: true, jobId: id, kind };
+    // ADR-004 W1: queued work is *accepted*, not *ok*. `ok` is reserved for
+    // completed work; the caller holds jobId and watches history/the bus.
+    return { accepted: true, jobId: id, kind };
   }
 
   return {

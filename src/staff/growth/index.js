@@ -412,7 +412,8 @@ function bootGrowth(deps) {
       }
       const m = (mode === "deep" || mode === "lite") ? mode : cfg.defaultMode;
       launchDream(m, reason || "manual request from dashboard");
-      return { ok: true, mode: m };
+      // ADR-004 W1: the dream is launched, not finished — accepted, not ok.
+      return { accepted: true, mode: m };
     },
   };
 }
