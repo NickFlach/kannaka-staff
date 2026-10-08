@@ -58,7 +58,8 @@ existing alerts:
 
   - `KANNAKA.staff.stream.silent`        — Ear confirmed dead air
   - `KANNAKA.staff.stream.recovered`     — Ear sees audio again
-  - `KANNAKA.staff.voice.lock.stuck`     — Voice held lock past threshold
+  - `KANNAKA.staff.voice.lock.stuck`     — Voice: lock held IDLE (speaking: false) past VOICE_STUCK_MS
+  - `KANNAKA.staff.voice.lock.long`      — Voice: lock held BUSY (speaking: true) past VOICE_BUSY_CEILING_MS; alert only
   - `KANNAKA.staff.voice.lock.recovered` — Voice lock cleared
   - `KANNAKA.staff.album.starving`       — Curator: album crossed 48h
   - `KANNAKA.staff.album.never_played`   — Curator: registered but absent
@@ -87,6 +88,8 @@ The first authorized loop:
 | Trigger                                                              | Action                          | Predicate                                                                                          |
 | -------------------------------------------------------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------- |
 | `stream.silent` (Ear) — has been silent for ≥ EAR_CONFIRM_TICKS      | `restart-radio` via Watcher     | no auto-restart in the last `AUTO_RECOVER_COOLDOWN_MS` (default 30 min); record to alerts.jsonl    |
+| `voice.lock.stuck` (Voice) — talk lock held with `speaking: false` for ≥ VOICE_STUCK_MS (default 15 min) | `restart-radio` via Watcher (same cooldown bucket) | the lock is IDLE: nothing rendering, nothing in flight. A lock the radio's own 720 s inject ceiling should have released. |
+| `voice.lock.long` (Voice) — talk lock held with `speaking: true` for ≥ VOICE_BUSY_CEILING_MS (default 30 min) | none (alert only) | a busy lock is long-form running long (TTS retrying, a voice in flight); restarting it is the outage. 2026-10-08: three auto-restarts mid-oration under the old 5-min rule. |
 
 Future loops follow the same shape: a single role acts on its
 authority, never on inferred consensus, and the action is rate-
