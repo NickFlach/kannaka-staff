@@ -34,6 +34,7 @@ const INVENTORY = {
   "KANNAKA.staff.stream.silent": "staff/ear/index.js",
   "KANNAKA.staff.stream.recovered": "staff/ear/index.js",
   "KANNAKA.staff.voice.lock.stuck": "staff/voice/index.js",
+  "KANNAKA.staff.voice.lock.long": "staff/voice/index.js",
   "KANNAKA.staff.voice.lock.recovered": "staff/voice/index.js",
   "KANNAKA.staff.album.starving": "staff/curator/index.js",
   "KANNAKA.staff.album.never_played": "staff/curator/index.js",

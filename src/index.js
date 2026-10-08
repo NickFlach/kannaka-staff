@@ -1984,14 +1984,20 @@ if (!EXTERNAL_MODE) {
   staffBus.on("KANNAKA.staff.stream.silent", (ev) => {
     runAutoRecoverRestart(`stream silent (variance=${ev.payload.variance.toFixed(1)}, streak=${ev.payload.silentStreak})`);
   });
-  // Voice-lock-stuck trigger: TTS queue jammed → restart fixes it.
+  // Voice-lock-stuck trigger: an IDLE lock (nothing speaking) held past
+  // VOICE_STUCK_MS is one the radio's own 720 s release missed → restart.
+  // Voice only publishes this for an idle lock; a lock that is busy
+  // (TTS rendering or retrying, a voice in flight) publishes
+  // voice.lock.long instead, which is alert-only: on 2026-10-08 the old
+  // 5-minute rule restarted the radio three times while the peace
+  // oration's TTS was still retrying, and the restarts were the outage.
   // Shares the SAME cooldown bucket as stream.silent because both
   // failures usually want the same remedy and we don't want a stuck
   // lock + dead air co-occurring to cause a double-restart.
   staffBus.on("KANNAKA.staff.voice.lock.stuck", (ev) => {
-    runAutoRecoverRestart(`talk-segment lock stuck for ${Math.round(ev.payload.heldForMs / 60000)}m`);
+    runAutoRecoverRestart(`talk-segment lock stuck for ${Math.round(ev.payload.heldForMs / 60000)}m (idle ${Math.round((ev.payload.idleForMs || 0) / 60000)}m)`);
   });
-  console.log(`[staff] auto-recover online — stream.silent + voice.lock.stuck → restart-radio (shared cooldown ${Math.round(AUTO_RECOVER.cooldownMs / 60000)}m)`);
+  console.log(`[staff] auto-recover online — stream.silent + voice.lock.stuck (idle lock only) → restart-radio (shared cooldown ${Math.round(AUTO_RECOVER.cooldownMs / 60000)}m); voice.lock.long is alert-only`);
 }
 
 // Second closed loop — album rescue. When Curator flags an album as
