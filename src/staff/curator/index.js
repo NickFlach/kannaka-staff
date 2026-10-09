@@ -60,6 +60,15 @@ const DEFAULTS = {
   MIN_HISTORY_FOR_ALERTS: 30,
 };
 
+// Virtual albums the radio appends to its album list on top of the real
+// ALBUMS registry (kannaka-radio server/dj-engine.js getState():
+// `albums: [...Object.keys(ALBUMS), "Dream Tracks", "Deep Cuts"]`).
+// They are generated buckets, not folders of files: one can legitimately
+// go a whole history window without airing, and "check that files exist"
+// is never the right action for them. Curator ignores them (#109).
+// Keep this list in step with that line in the radio.
+const VIRTUAL_ALBUMS = new Set(["Dream Tracks", "Deep Cuts"]);
+
 function probeHttpJson(target, timeoutMs = 5000, maxBody = 200 * 1024) {
   return new Promise((resolve) => {
     const u = url.parse(target);
@@ -108,7 +117,7 @@ async function fetchStaleness(radioBase, historyLimit) {
   if (stateR.ok) {
     try {
       const s = JSON.parse(stateR.body);
-      allAlbums = (s.albums || []).map((a) => a.name || a);
+      allAlbums = (s.albums || []).map((a) => a.name || a).filter((a) => !VIRTUAL_ALBUMS.has(a));
     } catch (_) { /* ignore */ }
   }
   const albums = [];
@@ -163,6 +172,7 @@ function evaluateAlbums({ cfg, albums, historyLen, classification = {}, alerted 
   const alerts = [];
 
   for (const raw of albums) {
+    if (VIRTUAL_ALBUMS.has(raw.album)) continue; // #109: generated bucket, not an album
     const album = { ...raw };
     if (album.lastPlayed) {
       nextEverPlayed[album.album] = Math.max(album.lastPlayed, nextEverPlayed[album.album] || 0);
@@ -364,4 +374,4 @@ function bootCurator(deps) {
   };
 }
 
-module.exports = { bootCurator, evaluateAlbums, classifyAge };
+module.exports = { bootCurator, evaluateAlbums, classifyAge, VIRTUAL_ALBUMS };

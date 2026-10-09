@@ -1608,8 +1608,26 @@ function confirmAct(action, params) {
 </body></html>`;
 }
 
+// Parse a raw request target once so GET routes match on the pathname
+// alone (#106): `/api/state?x=1` must reach the same handler as
+// `/api/state`. The query stays available as `searchParams` for any
+// handler that wants it. A target that will not parse gets an empty
+// pathname, which matches no route and falls through to the 404.
+function requestTarget(rawUrl) {
+  try {
+    const u = new URL(rawUrl || "/", "http://localhost");
+    return { pathname: u.pathname, searchParams: u.searchParams };
+  } catch (_) {
+    return { pathname: "", searchParams: new URLSearchParams() };
+  }
+}
+
 const server = http.createServer((req, res) => {
-  if (req.url === "/" || req.url === "/index.html") {
+  // `searchParams` is the query for handlers that want it; routing
+  // below compares `pathname` only. POST /action/* still signs and
+  // parses the raw req.url (the HMAC covers the query string).
+  const { pathname, searchParams } = requestTarget(req.url);
+  if (pathname === "/" || pathname === "/index.html") {
     const isLocal = isLocalCaller({
       remoteAddress: req.socket.remoteAddress || "",
       forwardedFor: req.headers["x-forwarded-for"],
@@ -1619,7 +1637,7 @@ const server = http.createServer((req, res) => {
     res.end(dashboardHtml(actionAvailability({ isLocal, secret: process.env.STAFF_SHARED_SECRET })));
     return;
   }
-  if (req.url === "/api/state") {
+  if (pathname === "/api/state") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       startedAt: state.startedAt,
@@ -1628,12 +1646,12 @@ const server = http.createServer((req, res) => {
     }));
     return;
   }
-  if (req.url.startsWith("/api/alerts")) {
+  if (pathname.startsWith("/api/alerts")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(recentAlerts(100)));
     return;
   }
-  if (req.url === "/api/album-staleness") {
+  if (pathname === "/api/album-staleness") {
     try {
       const st = curator ? curator.getState() : null;
       // Include lastTick so callers can detect a stale snapshot (e.g. radio
@@ -1650,57 +1668,57 @@ const server = http.createServer((req, res) => {
     }
     return;
   }
-  if (req.url === "/api/growth") {
+  if (pathname === "/api/growth") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(growth ? { ok: true, ...growth.getState() } : { ok: false, error: "growth not online (EXTERNAL_MODE?)" }));
     return;
   }
-  if (req.url === "/api/curator") {
+  if (pathname === "/api/curator") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(curator ? { ok: true, ...curator.getState() } : { ok: false, error: "curator not online" }));
     return;
   }
-  if (req.url === "/api/distributor") {
+  if (pathname === "/api/distributor") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(distributor ? { ok: true, ...distributor.getState() } : { ok: false, error: "distributor not online (EXTERNAL_MODE?)" }));
     return;
   }
-  if (req.url === "/api/distributor/log") {
+  if (pathname === "/api/distributor/log") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(distributor ? distributor.getLog() : { ok: false, error: "distributor not online" }));
     return;
   }
-  if (req.url === "/api/creator") {
+  if (pathname === "/api/creator") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(creator ? { ok: true, ...creator.getState() } : { ok: false, error: "creator not online" }));
     return;
   }
-  if (req.url === "/api/marketer") {
+  if (pathname === "/api/marketer") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(marketer ? { ok: true, ...marketer.getState() } : { ok: false, error: "marketer not online (EXTERNAL_MODE?)" }));
     return;
   }
-  if (req.url === "/api/voice") {
+  if (pathname === "/api/voice") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(voice ? { ok: true, ...voice.getState() } : { ok: false, error: "voice not online" }));
     return;
   }
-  if (req.url === "/api/ear") {
+  if (pathname === "/api/ear") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(ear ? { ok: true, ...ear.getState() } : { ok: false, error: "ear not online" }));
     return;
   }
-  if (req.url === "/api/storyteller") {
+  if (pathname === "/api/storyteller") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(storyteller ? { ok: true, ...storyteller.getState() } : { ok: false, error: "storyteller not online" }));
     return;
   }
-  if (req.url.startsWith("/api/bus")) {
+  if (pathname.startsWith("/api/bus")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, count: busRing.length, events: busRing.slice().reverse() }));
     return;
   }
-  if (req.url === "/api/health") {
+  if (pathname === "/api/health") {
     // ADR-004 W5: per-subsystem tick freshness. HTTP 200 only when nothing
     // is wedged — a stale loop is a 503, visible to one curl.
     const snap = healthSnapshot({
@@ -1811,6 +1829,10 @@ module.exports = {
   // That JS lives inside a template literal, where `node --check
   // src/index.js` cannot see a syntax error in it.
   dashboardHtml,
+  // #106: route-on-pathname parsing, and the (never-listening when
+  // required) server so the suite can drive real requests through it.
+  requestTarget,
+  server,
 };
 if (require.main !== module) return;
 
