@@ -210,3 +210,25 @@ test("#77: a state file with no streak field still loads (older format)", () => 
   assert.strictEqual(ear.getState().silentStreak, 0);
   assert.strictEqual(ear.getState().silentAlerted, true);
 });
+
+// ── #109: the radio's virtual albums are not registered albums ──
+
+test("#109: Dream Tracks / Deep Cuts never raise NEVER_PLAYED or STARVING", () => {
+  const albums = [
+    { album: "BEND THE ARC", lastPlayed: NOW - HOUR, ageMs: HOUR, playsInWindow: 30 },
+    { album: "Dream Tracks", lastPlayed: null, ageMs: null, playsInWindow: 0 },
+    { album: "Deep Cuts", lastPlayed: NOW - 72 * HOUR, ageMs: 72 * HOUR, playsInWindow: 1 },
+  ];
+  const r = evaluateAlbums({ cfg: CFG, albums, historyLen: 30, now: NOW });
+  assert.deepStrictEqual(transitions(r), []);
+  assert.deepStrictEqual(r.classification, { "BEND THE ARC": "fresh" });
+});
+
+test("#109: a real never-played album still alerts beside the virtual ones", () => {
+  const albums = [
+    { album: "Dream Tracks", lastPlayed: null, ageMs: null, playsInWindow: 0 },
+    { album: "Ghost Album", lastPlayed: null, ageMs: null, playsInWindow: 0 },
+  ];
+  const r = evaluateAlbums({ cfg: CFG, albums, historyLen: 30, now: NOW });
+  assert.deepStrictEqual(r.alerts.map((a) => a.payload.album), ["Ghost Album"]);
+});
